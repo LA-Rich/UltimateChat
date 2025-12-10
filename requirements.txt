@@ -15,34 +15,40 @@ python-pptx>=0.6.21
 # Image Processing
 pillow>=10.0.0
 
-# Image Generation (Stable Diffusion)
-# Uncomment for local GPU image generation:
-# torch>=2.0.0
-# diffusers>=0.24.0
-# transformers>=4.35.0
-# accelerate>=0.24.0
+# =============================================================================
+# GPU Image/Video Generation (Stable Diffusion) - RTX 4090
+# =============================================================================
+torch>=2.0.0
+torchvision>=0.15.0
+diffusers>=0.24.0
+transformers>=4.35.0
+accelerate>=0.24.0
+safetensors>=0.4.0
+xformers>=0.0.23  # Memory efficient attention for 4090
 
-# Audio Generation (Text-to-Speech)
+# Video Generation
+imageio>=2.31.0
+imageio-ffmpeg>=0.4.8
+
+# =============================================================================
+# Audio Generation
+# =============================================================================
 gtts>=2.3.0
 pydub>=0.25.1
 
-# Video Processing
-# imageio>=2.31.0
-# imageio-ffmpeg>=0.4.8
-# moviepy>=1.0.3
-
-# QR Code Generation
+# =============================================================================
+# Data Visualization & Documents
+# =============================================================================
 qrcode>=7.4.2
-
-# Charts and Graphs
 matplotlib>=3.7.0
-
-# Data Processing
 pandas>=2.0.0
-
-# Markdown to PDF
 markdown>=3.4.0
-
-# Excel Support
 openpyxl>=3.1.0
 xlsxwriter>=3.1.0
+
+# =============================================================================
+# Optional: Advanced Image Models
+# =============================================================================
+# For SDXL and newer models:
+# invisible-watermark>=0.2.0
+# omegaconf>=2.3.0

@@ -512,9 +512,18 @@ def stream_response(provider, model, messages):
 # =============================================================================
 
 sd_pipeline = None
+svd_pipeline = None
+
+# GPU Settings from env
+SD_MODEL = os.getenv("SD_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
+SD_STEPS = int(os.getenv("SD_STEPS", 30))
+SD_GUIDANCE = float(os.getenv("SD_GUIDANCE_SCALE", 7.5))
+VIDEO_MODEL = os.getenv("VIDEO_MODEL", "stabilityai/stable-video-diffusion-img2vid-xt")
+VIDEO_FRAMES = int(os.getenv("VIDEO_FRAMES", 25))
+VIDEO_FPS = int(os.getenv("VIDEO_FPS", 7))
 
 def load_sd_pipeline():
-    """Load Stable Diffusion pipeline."""
+    """Load Stable Diffusion XL pipeline optimized for RTX 4090."""
     global sd_pipeline
     if sd_pipeline is not None:
         return sd_pipeline
@@ -523,48 +532,128 @@ def load_sd_pipeline():
         return None
     
     try:
-        from diffusers import StableDiffusionPipeline
         import torch
         
-        model_id = "runwayml/stable-diffusion-v1-5"
+        # Check CUDA availability
+        if not torch.cuda.is_available():
+            print("[SD] CUDA not available, image generation disabled")
+            return None
         
-        if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"[SD] Detected GPU: {gpu_name} ({vram:.1f} GB VRAM)")
+        
+        # Use SDXL for better quality on 4090
+        if "stabilityai/stable-diffusion-xl" in SD_MODEL:
+            from diffusers import StableDiffusionXLPipeline, AutoencoderKL
+            
+            print(f"[SD] Loading SDXL model: {SD_MODEL}")
+            
+            # Load VAE for better quality
+            vae = AutoencoderKL.from_pretrained(
+                "madebyollin/sdxl-vae-fp16-fix",
+                torch_dtype=torch.float16
+            )
+            
+            sd_pipeline = StableDiffusionXLPipeline.from_pretrained(
+                SD_MODEL,
+                vae=vae,
+                torch_dtype=torch.float16,
+                variant="fp16",
+                use_safetensors=True
+            ).to("cuda")
+            
+        else:
+            from diffusers import StableDiffusionPipeline
+            
+            print(f"[SD] Loading SD model: {SD_MODEL}")
             sd_pipeline = StableDiffusionPipeline.from_pretrained(
-                model_id,
+                SD_MODEL,
                 torch_dtype=torch.float16,
                 safety_checker=None
             ).to("cuda")
-        else:
-            sd_pipeline = StableDiffusionPipeline.from_pretrained(
-                model_id,
-                safety_checker=None
-            )
         
-        print("[SD] Stable Diffusion pipeline loaded successfully")
+        # Enable memory optimizations for 4090
+        try:
+            sd_pipeline.enable_xformers_memory_efficient_attention()
+            print("[SD] xformers memory efficient attention enabled")
+        except:
+            print("[SD] xformers not available, using default attention")
+        
+        # Enable VAE slicing for large images
+        sd_pipeline.enable_vae_slicing()
+        
+        print(f"[SD] Pipeline loaded successfully! Ready to generate images.")
         return sd_pipeline
+        
     except Exception as e:
         print(f"[SD] Failed to load pipeline: {e}")
+        traceback.print_exc()
         return None
 
-def generate_image_with_progress(prompt, task_id, num_steps=50):
-    """Generate image with progress tracking."""
+def load_video_pipeline():
+    """Load Stable Video Diffusion pipeline for RTX 4090."""
+    global svd_pipeline
+    if svd_pipeline is not None:
+        return svd_pipeline
     
-    def progress_callback(step, timestep, latents):
+    if not ENABLE_VIDEO_GEN:
+        return None
+    
+    try:
+        import torch
+        from diffusers import StableVideoDiffusionPipeline
+        from diffusers.utils import export_to_video
+        
+        if not torch.cuda.is_available():
+            print("[SVD] CUDA not available, video generation disabled")
+            return None
+        
+        print(f"[SVD] Loading video model: {VIDEO_MODEL}")
+        
+        svd_pipeline = StableVideoDiffusionPipeline.from_pretrained(
+            VIDEO_MODEL,
+            torch_dtype=torch.float16,
+            variant="fp16"
+        ).to("cuda")
+        
+        # Enable memory optimizations
+        try:
+            svd_pipeline.enable_xformers_memory_efficient_attention()
+        except:
+            pass
+        
+        print("[SVD] Video pipeline loaded successfully!")
+        return svd_pipeline
+        
+    except Exception as e:
+        print(f"[SVD] Failed to load pipeline: {e}")
+        traceback.print_exc()
+        return None
+
+def generate_image_with_progress(prompt, task_id, num_steps=None):
+    """Generate image with SDXL and progress tracking."""
+    import torch
+    
+    num_steps = num_steps or SD_STEPS
+    
+    def progress_callback(pipe, step, timestep, callback_kwargs):
         if task_manager.is_cancelled(task_id):
             raise InterruptedError("Generation cancelled by user")
-        progress = int((step / num_steps) * 100)
+        progress = int(10 + (step / num_steps) * 80)  # 10-90% for generation
         task_manager.update_task(task_id, 
             step=2, 
             step_name=f'Generating image... Step {step}/{num_steps}',
             progress=progress,
             status='running'
         )
+        return callback_kwargs
     
-    task_manager.update_task(task_id, step=1, step_name='Loading Stable Diffusion model...', progress=5)
+    task_manager.update_task(task_id, step=1, step_name='Loading Stable Diffusion XL...', progress=5)
     
     pipeline = load_sd_pipeline()
     if pipeline is None:
-        task_manager.update_task(task_id, status='error', error='Image generation not available')
+        task_manager.update_task(task_id, status='error', error='Image generation not available. Check CUDA/GPU setup.')
         return None, "Image generation not available"
     
     if task_manager.is_cancelled(task_id):
@@ -574,12 +663,18 @@ def generate_image_with_progress(prompt, task_id, num_steps=50):
     try:
         task_manager.update_task(task_id, step=2, step_name='Starting generation...', progress=10)
         
-        image = pipeline(
-            prompt, 
-            num_inference_steps=num_steps,
-            callback=progress_callback,
-            callback_steps=1
-        ).images[0]
+        # Generate with SDXL settings
+        with torch.inference_mode():
+            result = pipeline(
+                prompt=prompt,
+                num_inference_steps=num_steps,
+                guidance_scale=SD_GUIDANCE,
+                height=1024,
+                width=1024,
+                callback_on_step_end=progress_callback,
+            )
+        
+        image = result.images[0]
         
         if task_manager.is_cancelled(task_id):
             task_manager.update_task(task_id, status='cancelled')
@@ -589,7 +684,10 @@ def generate_image_with_progress(prompt, task_id, num_steps=50):
         
         filename = f"image_{uuid.uuid4().hex[:8]}.png"
         filepath = GALLERY_DIR / filename
-        image.save(str(filepath))
+        image.save(str(filepath), quality=95)
+        
+        # Save to database
+        save_generated_file('image', filename, f"/gallery/{filename}", prompt[:200])
         
         task_manager.update_task(task_id, step=4, step_name='Complete!', progress=100, status='completed', result=f"/gallery/{filename}")
         
@@ -600,23 +698,134 @@ def generate_image_with_progress(prompt, task_id, num_steps=50):
         return None, "Cancelled"
     except Exception as e:
         print(f"[SD] Generation error: {e}")
+        traceback.print_exc()
         task_manager.update_task(task_id, status='error', error=str(e))
         return None, str(e)
 
-def generate_image(prompt, num_steps=50):
+def generate_image(prompt, num_steps=None):
     """Generate image from prompt (legacy, no progress)."""
+    import torch
+    num_steps = num_steps or SD_STEPS
+    
     pipeline = load_sd_pipeline()
     if pipeline is None:
         return None, "Image generation not available"
     
     try:
-        image = pipeline(prompt, num_inference_steps=num_steps).images[0]
+        with torch.inference_mode():
+            result = pipeline(
+                prompt=prompt,
+                num_inference_steps=num_steps,
+                guidance_scale=SD_GUIDANCE,
+                height=1024,
+                width=1024
+            )
+        image = result.images[0]
         filename = f"image_{uuid.uuid4().hex[:8]}.png"
         filepath = GALLERY_DIR / filename
         image.save(str(filepath))
+        save_generated_file('image', filename, f"/gallery/{filename}", prompt[:200])
         return f"/gallery/{filename}", None
     except Exception as e:
         print(f"[SD] Generation error: {e}")
+        return None, str(e)
+
+# =============================================================================
+# Video Generation (Stable Video Diffusion)
+# =============================================================================
+
+def generate_video_with_progress(prompt_or_image, task_id):
+    """Generate video from prompt or image using Stable Video Diffusion."""
+    import torch
+    from PIL import Image
+    
+    task_manager.update_task(task_id, step=1, step_name='Loading video generation model...', progress=5)
+    
+    try:
+        # First generate an image if we got a text prompt
+        if isinstance(prompt_or_image, str):
+            task_manager.update_task(task_id, step=1, step_name='Generating base image from prompt...', progress=10)
+            
+            sd_pipe = load_sd_pipeline()
+            if sd_pipe is None:
+                task_manager.update_task(task_id, status='error', error='Image generation not available')
+                return None, "Image generation not available"
+            
+            if task_manager.is_cancelled(task_id):
+                task_manager.update_task(task_id, status='cancelled')
+                return None, "Cancelled"
+            
+            with torch.inference_mode():
+                result = sd_pipe(
+                    prompt=prompt_or_image,
+                    num_inference_steps=20,  # Fewer steps for base image
+                    guidance_scale=7.5,
+                    height=576,  # SVD preferred size
+                    width=1024
+                )
+            base_image = result.images[0]
+        else:
+            base_image = prompt_or_image
+        
+        if task_manager.is_cancelled(task_id):
+            task_manager.update_task(task_id, status='cancelled')
+            return None, "Cancelled"
+        
+        task_manager.update_task(task_id, step=2, step_name='Loading Stable Video Diffusion...', progress=30)
+        
+        video_pipe = load_video_pipeline()
+        if video_pipe is None:
+            task_manager.update_task(task_id, status='error', error='Video generation not available')
+            return None, "Video generation not available"
+        
+        # Resize image for SVD
+        base_image = base_image.resize((1024, 576))
+        
+        task_manager.update_task(task_id, step=3, step_name='Generating video frames...', progress=40)
+        
+        if task_manager.is_cancelled(task_id):
+            task_manager.update_task(task_id, status='cancelled')
+            return None, "Cancelled"
+        
+        # Generate video frames
+        with torch.inference_mode():
+            frames = video_pipe(
+                base_image,
+                num_frames=VIDEO_FRAMES,
+                decode_chunk_size=8,  # Memory optimization
+                motion_bucket_id=127,  # Motion amount
+                noise_aug_strength=0.02
+            ).frames[0]
+        
+        task_manager.update_task(task_id, step=4, step_name='Encoding video...', progress=80)
+        
+        if task_manager.is_cancelled(task_id):
+            task_manager.update_task(task_id, status='cancelled')
+            return None, "Cancelled"
+        
+        # Save video
+        from diffusers.utils import export_to_video
+        
+        filename = f"video_{uuid.uuid4().hex[:8]}.mp4"
+        filepath = VIDEO_DIR / filename
+        export_to_video(frames, str(filepath), fps=VIDEO_FPS)
+        
+        # Save to database
+        prompt_text = prompt_or_image if isinstance(prompt_or_image, str) else "image-to-video"
+        save_generated_file('video', filename, f"/videos/{filename}", prompt_text[:200])
+        
+        task_manager.update_task(task_id, step=5, step_name='Complete!', progress=100, status='completed',
+                                result={'url': f"/videos/{filename}", 'filename': filename})
+        
+        return f"/videos/{filename}", filename
+        
+    except InterruptedError:
+        task_manager.update_task(task_id, status='cancelled')
+        return None, "Cancelled"
+    except Exception as e:
+        print(f"[SVD] Video generation error: {e}")
+        traceback.print_exc()
+        task_manager.update_task(task_id, status='error', error=str(e))
         return None, str(e)
 
 # =============================================================================
@@ -1332,6 +1541,44 @@ def stream_chat():
                 yield f"data: {json.dumps({'task_complete': task_id})}\n\n"
             else:
                 yield f"data: {json.dumps({'content': '⚠️ Image generation is not enabled. Set `ENABLE_IMAGE_GENERATION=true` in your .env file and install the required dependencies (torch, diffusers, transformers).'})}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+            return
+        
+        # Video generation with progress tracking
+        if any(phrase in lower_msg for phrase in ['generate video', 'create video', 'make a video', 'animate']):
+            if ENABLE_VIDEO_GEN:
+                task_id = task_manager.create_task('video_generation')
+                yield f"data: {json.dumps({'task_start': {'id': task_id, 'type': 'video', 'title': '🎬 Video Generation', 'steps': ['Generating base image', 'Loading video model', 'Generating frames', 'Encoding video', 'Saving']}})}\n\n"
+                
+                def run_video():
+                    generate_video_with_progress(message, task_id)
+                
+                thread = threading.Thread(target=run_video)
+                thread.start()
+                
+                last_progress = -1
+                while thread.is_alive() or task_manager.get_task(task_id).get('status') == 'running':
+                    task = task_manager.get_task(task_id)
+                    if task.get('progress', 0) != last_progress:
+                        yield f"data: {json.dumps({'task_progress': task})}\n\n"
+                        last_progress = task.get('progress', 0)
+                    time.sleep(0.2)
+                
+                thread.join()
+                
+                task = task_manager.get_task(task_id)
+                if task.get('status') == 'completed' and task.get('result'):
+                    yield f"data: {json.dumps({'video': task['result']['url']})}\n\n"
+                    yield f"data: {json.dumps({'content': '✅ Video generated successfully! Click to play.'})}\n\n"
+                elif task.get('status') == 'cancelled':
+                    yield f"data: {json.dumps({'content': '⚠️ Video generation was cancelled.'})}\n\n"
+                else:
+                    error_msg = task.get('error', 'Unknown error')
+                    yield f"data: {json.dumps({'content': f'❌ Failed: {error_msg}'})}\n\n"
+                
+                yield f"data: {json.dumps({'task_complete': task_id})}\n\n"
+            else:
+                yield f"data: {json.dumps({'content': '⚠️ Video generation is not enabled. Set `ENABLE_VIDEO_GENERATION=true` in your .env file.'})}\n\n"
             yield f"data: {json.dumps({'done': True})}\n\n"
             return
         
@@ -2343,6 +2590,13 @@ HTML_TEMPLATE = '''
             border-radius: 20px;
             font-size: 13px;
             color: var(--text-secondary);
+            transition: all 0.2s;
+        }
+        
+        .capability-item.highlight {
+            background: linear-gradient(135deg, rgba(139, 92, 246, 0.2), rgba(236, 72, 153, 0.2));
+            border-color: var(--accent);
+            color: var(--text-primary);
         }
         
         .capability-icon {
@@ -2376,6 +2630,15 @@ HTML_TEMPLATE = '''
             border-color: var(--accent);
             transform: translateY(-2px);
         }
+        
+        .quick-prompt.featured {
+            background: linear-gradient(135deg, rgba(139, 92, 246, 0.15), rgba(236, 72, 153, 0.15));
+            border-color: var(--accent);
+        }
+        .quick-prompt.featured:hover {
+            background: linear-gradient(135deg, rgba(139, 92, 246, 0.25), rgba(236, 72, 153, 0.25));
+            box-shadow: 0 4px 20px rgba(139, 92, 246, 0.2);
+        }
 
         .quick-prompt-icon {
             font-size: 20px;
@@ -2385,6 +2648,10 @@ HTML_TEMPLATE = '''
         .quick-prompt-text {
             font-size: 14px;
             color: var(--text-secondary);
+        }
+        
+        .quick-prompt.featured .quick-prompt-text {
+            color: var(--text-primary);
         }
 
         /* Messages */
@@ -3275,9 +3542,13 @@ HTML_TEMPLATE = '''
                             <span class="capability-icon">💬</span>
                             <span>Multi-Model Chat</span>
                         </div>
-                        <div class="capability-item">
+                        <div class="capability-item highlight">
                             <span class="capability-icon">🎨</span>
-                            <span>Image Generation</span>
+                            <span>SDXL Images</span>
+                        </div>
+                        <div class="capability-item highlight">
+                            <span class="capability-icon">🎬</span>
+                            <span>AI Video</span>
                         </div>
                         <div class="capability-item">
                             <span class="capability-icon">🔊</span>
@@ -3300,29 +3571,29 @@ HTML_TEMPLATE = '''
                     <p class="welcome-hint">Try these commands to get started:</p>
                     
                     <div class="quick-prompts">
-                        <div class="quick-prompt" onclick="sendQuickPrompt('Explain how neural networks work')">
-                            <div class="quick-prompt-icon">🧠</div>
-                            <div class="quick-prompt-text">Explain neural networks</div>
+                        <div class="quick-prompt featured" onclick="sendQuickPrompt('Generate image of a cyberpunk city at night with neon lights and flying cars')">
+                            <div class="quick-prompt-icon">🎨</div>
+                            <div class="quick-prompt-text">Generate AI image (SDXL)</div>
+                        </div>
+                        <div class="quick-prompt featured" onclick="sendQuickPrompt('Generate video of a serene mountain landscape with flowing clouds')">
+                            <div class="quick-prompt-icon">🎬</div>
+                            <div class="quick-prompt-text">Generate AI video</div>
                         </div>
                         <div class="quick-prompt" onclick="sendQuickPrompt('Generate audio: Welcome to Ultimate Chat, your all-in-one AI assistant!')">
                             <div class="quick-prompt-icon">🔊</div>
-                            <div class="quick-prompt-text">Generate audio greeting</div>
+                            <div class="quick-prompt-text">Generate audio</div>
                         </div>
                         <div class="quick-prompt" onclick="sendQuickPrompt('Create a bar chart with data: Sales:150, Marketing:80, Development:200, Support:60')">
                             <div class="quick-prompt-icon">📊</div>
-                            <div class="quick-prompt-text">Create a bar chart</div>
+                            <div class="quick-prompt-text">Create a chart</div>
                         </div>
                         <div class="quick-prompt" onclick="sendQuickPrompt('Generate QR code for https://github.com')">
                             <div class="quick-prompt-icon">📱</div>
-                            <div class="quick-prompt-text">Generate a QR code</div>
+                            <div class="quick-prompt-text">Generate QR code</div>
                         </div>
-                        <div class="quick-prompt" onclick="sendQuickPrompt('Create a PDF summary of the benefits of AI in healthcare')">
-                            <div class="quick-prompt-icon">📕</div>
-                            <div class="quick-prompt-text">Create a PDF document</div>
-                        </div>
-                        <div class="quick-prompt" onclick="sendQuickPrompt('Generate Excel spreadsheet with sample sales data')">
-                            <div class="quick-prompt-icon">📗</div>
-                            <div class="quick-prompt-text">Generate spreadsheet</div>
+                        <div class="quick-prompt" onclick="sendQuickPrompt('Explain how transformers work in AI')">
+                            <div class="quick-prompt-icon">🧠</div>
+                            <div class="quick-prompt-text">Ask anything</div>
                         </div>
                     </div>
                 </div>
