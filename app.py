@@ -138,10 +138,11 @@ PROVIDERS = {
         "name": "Google",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent",
         "models": [
-            "gemini-2.5-pro-preview-06-05",  # Latest Gemini 2.5
-            "gemini-2.5-flash-preview-05-20",  # Gemini 2.5 Flash
-            "gemini-2.0-flash", "gemini-2.0-flash-lite",  # Gemini 2.0 series
-            "gemini-1.5-pro", "gemini-1.5-flash", "gemini-1.5-flash-8b"  # Gemini 1.5 series
+            "gemini-2.0-flash-exp",  # Latest Gemini 2.0 experimental
+            "gemini-1.5-pro-latest",  # Gemini 1.5 Pro (recommended)
+            "gemini-1.5-flash-latest",  # Gemini 1.5 Flash (fast)
+            "gemini-1.5-flash-8b-latest",  # Gemini 1.5 Flash 8B (fastest)
+            "gemini-pro"  # Legacy model
         ],
         "icon": "🔵"
     },
