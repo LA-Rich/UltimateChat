@@ -321,6 +321,73 @@ def get_setting(key, default=None):
     conn.close()
     return row['value'] if row else default
 
+def generate_smart_title(message):
+    """Generate a smart, concise title from a message."""
+    import re
+    
+    # Clean the message
+    text = message.strip()
+    
+    # Remove common prefixes
+    prefixes_to_remove = [
+        r'^(hey|hi|hello|please|can you|could you|would you|i want to|i need to|help me|tell me about|what is|what are|how to|how do i|explain)\s*',
+    ]
+    for pattern in prefixes_to_remove:
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+    
+    # If it's a question, extract the topic
+    if '?' in text:
+        text = text.split('?')[0]
+    
+    # If it's a command for generation, make it descriptive
+    gen_patterns = [
+        (r'generate\s+(image|video|audio|pdf|chart|qr)', r'\1 generation'),
+        (r'create\s+(image|video|audio|pdf|chart|qr)', r'\1 creation'),
+        (r'make\s+(a|an)?\s*(image|video|audio|pdf|chart|qr)', r'\2 generation'),
+    ]
+    for pattern, replacement in gen_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            # Get what comes after
+            match = re.search(pattern + r'\s*(.*)', text, re.IGNORECASE)
+            if match:
+                topic = match.group(2) if len(match.groups()) > 1 else match.group(1)
+                subject = match.group(3) if len(match.groups()) > 2 else ''
+                if subject:
+                    text = f"{topic.title()}: {subject[:30]}"
+                else:
+                    text = f"{topic.title()} Generation"
+                break
+    
+    # Capitalize first letter of each word for title case
+    words = text.split()
+    
+    # Limit to key words (first 6 words or 40 chars)
+    title_words = []
+    char_count = 0
+    for word in words[:8]:
+        if char_count + len(word) > 40:
+            break
+        title_words.append(word)
+        char_count += len(word) + 1
+    
+    title = ' '.join(title_words)
+    
+    # Title case, but keep small words lowercase
+    small_words = {'a', 'an', 'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'is', 'are'}
+    words = title.split()
+    if words:
+        words[0] = words[0].capitalize()
+        for i in range(1, len(words)):
+            if words[i].lower() not in small_words:
+                words[i] = words[i].capitalize()
+        title = ' '.join(words)
+    
+    # Fallback if title is too short
+    if len(title) < 3:
+        title = message[:40] + ('...' if len(message) > 40 else '')
+    
+    return title
+
 def set_setting(key, value):
     conn = get_db()
     conn.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (key, value))
@@ -455,25 +522,56 @@ def stream_xai(messages, model, api_key):
     """Stream from xAI Grok API."""
     yield from stream_openai(messages, model, api_key, "https://api.x.ai/v1/chat/completions")
 
+def check_ollama_running(base_url=None):
+    """Check if Ollama is running and accessible."""
+    url = (base_url or "http://localhost:11434") + "/api/tags"
+    try:
+        req = urllib.request.Request(url, method='GET')
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            return True, [m['name'] for m in data.get('models', [])]
+    except Exception as e:
+        return False, str(e)
+
 def stream_ollama(messages, model, base_url=None):
-    """Stream from Ollama API."""
-    url = (base_url or "http://localhost:11434") + "/api/chat"
+    """Stream from Ollama API with better error handling."""
+    base = base_url or "http://localhost:11434"
+    
+    # First check if Ollama is running
+    is_running, result = check_ollama_running(base)
+    if not is_running:
+        yield f"\n\n⚠️ **Ollama is not running or not accessible.**\n\nPlease:\n1. Install Ollama from https://ollama.ai\n2. Start Ollama\n3. Pull a model: `ollama pull {model}`\n\nOr switch to a cloud provider (OpenAI, Claude, etc.) in Settings ⚙️"
+        return
+    
+    # Check if model exists
+    available_models = result
+    model_base = model.split(':')[0]
+    if not any(model_base in m for m in available_models):
+        yield f"\n\n⚠️ **Model '{model}' not found in Ollama.**\n\nAvailable models: {', '.join(available_models[:5]) if available_models else 'None'}\n\nPull it with: `ollama pull {model}`"
+        return
+    
+    url = f"{base}/api/chat"
     payload = {"model": model, "messages": messages, "stream": True}
     headers = {"Content-Type": "application/json"}
     
-    req = urllib.request.Request(url, json.dumps(payload).encode('utf-8'), headers, method='POST')
-    with urllib.request.urlopen(req, timeout=120) as response:
-        buffer = ""
-        for chunk in iter(lambda: response.read(1024), b''):
-            buffer += chunk.decode('utf-8')
-            while '\n' in buffer:
-                line, buffer = buffer.split('\n', 1)
-                if line.strip():
-                    try:
-                        data = json.loads(line)
-                        if data.get('message', {}).get('content'):
-                            yield data['message']['content']
-                    except: pass
+    try:
+        req = urllib.request.Request(url, json.dumps(payload).encode('utf-8'), headers, method='POST')
+        with urllib.request.urlopen(req, timeout=180) as response:  # Increased timeout
+            buffer = ""
+            for chunk in iter(lambda: response.read(1024), b''):
+                buffer += chunk.decode('utf-8')
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+                    if line.strip():
+                        try:
+                            data = json.loads(line)
+                            if data.get('message', {}).get('content'):
+                                yield data['message']['content']
+                        except: pass
+    except urllib.error.URLError as e:
+        yield f"\n\n❌ **Connection error:** {str(e.reason)}\n\nMake sure Ollama is running."
+    except Exception as e:
+        yield f"\n\n❌ **Error:** {str(e)}"
 
 def stream_response(provider, model, messages):
     """Route to appropriate provider streaming function."""
@@ -1478,6 +1576,8 @@ def stream_chat():
     req_attachments = data.get('attachments', [])
     req_provider = data.get('provider')
     req_model = data.get('model')
+    image_gen_enabled = data.get('image_gen_enabled', True)
+    video_gen_enabled = data.get('video_gen_enabled', True)
     
     if not conversation_id:
         return jsonify({'error': 'No conversation ID'}), 400
@@ -1505,6 +1605,10 @@ def stream_chat():
         
         # Image generation with progress tracking
         if any(phrase in lower_msg for phrase in ['generate image', 'create image', 'draw', 'make an image']):
+            if not image_gen_enabled:
+                yield f"data: {json.dumps({'content': '⚠️ Image generation is currently disabled. Enable it using the 🎨 toggle in the header.'})}\n\n"
+                yield f"data: {json.dumps({'done': True})}\n\n"
+                return
             if ENABLE_IMAGE_GEN:
                 task_id = task_manager.create_task('image_generation')
                 yield f"data: {json.dumps({'task_start': {'id': task_id, 'type': 'image', 'title': '🎨 Image Generation', 'steps': ['Loading Stable Diffusion model', 'Generating image', 'Post-processing', 'Saving to gallery']}})}\n\n"
@@ -1546,6 +1650,10 @@ def stream_chat():
         
         # Video generation with progress tracking
         if any(phrase in lower_msg for phrase in ['generate video', 'create video', 'make a video', 'animate']):
+            if not video_gen_enabled:
+                yield f"data: {json.dumps({'content': '⚠️ Video generation is currently disabled. Enable it using the 🎬 toggle in the header.'})}\n\n"
+                yield f"data: {json.dumps({'done': True})}\n\n"
+                return
             if ENABLE_VIDEO_GEN:
                 task_id = task_manager.create_task('video_generation')
                 yield f"data: {json.dumps({'task_start': {'id': task_id, 'type': 'video', 'title': '🎬 Video Generation', 'steps': ['Generating base image', 'Loading video model', 'Generating frames', 'Encoding video', 'Saving']}})}\n\n"
@@ -1827,7 +1935,9 @@ def stream_chat():
                      (conversation_id, 'assistant', full_response, '[]', now))
         
         message_count = conn.execute('SELECT COUNT(*) FROM messages WHERE conversation_id = ?', (conversation_id,)).fetchone()[0]
-        title = message[:50] + ('...' if len(message) > 50 else '')
+        
+        # Smart title generation from first message
+        title = generate_smart_title(message)
         conn.execute('UPDATE conversations SET title = ?, updated_at = ?, message_count = ? WHERE id = ? AND title = ?',
                      (title, now, message_count, conversation_id, 'New Conversation'))
         conn.commit()
@@ -2335,6 +2445,50 @@ HTML_TEMPLATE = '''
         .model-option .model-name { flex: 1; font-size: 13px; }
         .model-option .check { color: var(--accent); display: none; }
         .model-option.active .check { display: block; }
+        
+        /* Generation Toggles */
+        .gen-toggles {
+            display: flex;
+            gap: 6px;
+        }
+        
+        .gen-toggle {
+            padding: 6px 12px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            font-size: 13px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.2s;
+            color: var(--text-secondary);
+        }
+        .gen-toggle:hover {
+            border-color: var(--accent);
+        }
+        .gen-toggle.active {
+            background: linear-gradient(135deg, rgba(139, 92, 246, 0.2), rgba(236, 72, 153, 0.2));
+            border-color: var(--accent);
+            color: var(--text-primary);
+        }
+        .gen-toggle.disabled {
+            opacity: 0.5;
+            background: var(--bg-secondary);
+        }
+        
+        .toggle-status {
+            font-size: 10px;
+            font-weight: 600;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: var(--success);
+            color: white;
+        }
+        .gen-toggle.disabled .toggle-status {
+            background: var(--text-muted);
+        }
         
         .settings-btn {
             width: 40px;
@@ -3514,6 +3668,15 @@ HTML_TEMPLATE = '''
                     <h1 class="header-title" id="header-title">New Conversation</h1>
                 </div>
                 <div style="display: flex; align-items: center; gap: 12px;">
+                    <!-- Generation Toggles -->
+                    <div class="gen-toggles">
+                        <button class="gen-toggle" id="toggle-image" onclick="toggleGeneration('image')" title="Image Generation">
+                            🎨 <span class="toggle-status" id="image-status">ON</span>
+                        </button>
+                        <button class="gen-toggle" id="toggle-video" onclick="toggleGeneration('video')" title="Video Generation">
+                            🎬 <span class="toggle-status" id="video-status">ON</span>
+                        </button>
+                    </div>
                     <div class="model-selector" onclick="toggleModelDropdown(event)">
                         <span class="model-provider-icon" id="model-provider-icon">🦙</span>
                         <span id="current-model-display">llama3.2:latest</span>
@@ -3693,6 +3856,8 @@ HTML_TEMPLATE = '''
         let providers = {};
         let currentProvider = 'ollama';
         let currentModel = 'llama3.2:latest';
+        let imageGenEnabled = true;
+        let videoGenEnabled = true;
 
         // =============================================================================
         // Initialization
@@ -4187,7 +4352,9 @@ HTML_TEMPLATE = '''
                         conversation_id: currentConversationId,
                         attachments: currentAttachments,
                         provider: currentProvider,
-                        model: currentModel
+                        model: currentModel,
+                        image_gen_enabled: imageGenEnabled,
+                        video_gen_enabled: videoGenEnabled
                     })
                 });
                 
@@ -4779,6 +4946,51 @@ HTML_TEMPLATE = '''
                 showToast('Failed to delete file', 'error');
             }
         }
+        
+        // =============================================================================
+        // Generation Toggles
+        // =============================================================================
+        
+        function initGenerationToggles() {
+            // Load from localStorage
+            imageGenEnabled = localStorage.getItem('imageGenEnabled') !== 'false';
+            videoGenEnabled = localStorage.getItem('videoGenEnabled') !== 'false';
+            updateToggleUI();
+        }
+        
+        function toggleGeneration(type) {
+            if (type === 'image') {
+                imageGenEnabled = !imageGenEnabled;
+                localStorage.setItem('imageGenEnabled', imageGenEnabled);
+            } else if (type === 'video') {
+                videoGenEnabled = !videoGenEnabled;
+                localStorage.setItem('videoGenEnabled', videoGenEnabled);
+            }
+            updateToggleUI();
+            showToast(`${type.charAt(0).toUpperCase() + type.slice(1)} generation ${type === 'image' ? (imageGenEnabled ? 'enabled' : 'disabled') : (videoGenEnabled ? 'enabled' : 'disabled')}`, 'success');
+        }
+        
+        function updateToggleUI() {
+            const imageToggle = document.getElementById('toggle-image');
+            const videoToggle = document.getElementById('toggle-video');
+            const imageStatus = document.getElementById('image-status');
+            const videoStatus = document.getElementById('video-status');
+            
+            if (imageToggle) {
+                imageToggle.classList.toggle('active', imageGenEnabled);
+                imageToggle.classList.toggle('disabled', !imageGenEnabled);
+                imageStatus.textContent = imageGenEnabled ? 'ON' : 'OFF';
+            }
+            
+            if (videoToggle) {
+                videoToggle.classList.toggle('active', videoGenEnabled);
+                videoToggle.classList.toggle('disabled', !videoGenEnabled);
+                videoStatus.textContent = videoGenEnabled ? 'ON' : 'OFF';
+            }
+        }
+        
+        // Initialize toggles on page load
+        document.addEventListener('DOMContentLoaded', initGenerationToggles);
     </script>
 </body>
 </html>
