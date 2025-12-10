@@ -227,8 +227,86 @@ def init_db():
             key TEXT PRIMARY KEY,
             value TEXT
         );
+        
+        CREATE TABLE IF NOT EXISTS generated_files (
+            id TEXT PRIMARY KEY,
+            conversation_id TEXT,
+            file_type TEXT,
+            file_name TEXT,
+            file_path TEXT,
+            file_size INTEGER,
+            mime_type TEXT,
+            prompt TEXT,
+            metadata TEXT,
+            created_at TEXT,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE SET NULL
+        );
+        
+        CREATE INDEX IF NOT EXISTS idx_files_type ON generated_files(file_type);
+        CREATE INDEX IF NOT EXISTS idx_files_created ON generated_files(created_at);
     ''')
     conn.commit()
+    conn.close()
+
+# =============================================================================
+# Generated Files Manager
+# =============================================================================
+
+def save_generated_file(file_type, file_name, file_path, prompt="", conversation_id=None, metadata=None):
+    """Save a generated file record to the database."""
+    conn = get_db()
+    file_id = str(uuid.uuid4())[:12]
+    
+    # Get file size
+    full_path = BASE_DIR / file_path.lstrip('/')
+    file_size = full_path.stat().st_size if full_path.exists() else 0
+    
+    # Determine mime type
+    mime_types = {
+        'image': 'image/png',
+        'audio': 'audio/mpeg',
+        'video': 'video/mp4',
+        'pdf': 'application/pdf',
+        'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'qr': 'image/png',
+        'chart': 'image/png'
+    }
+    
+    conn.execute('''INSERT INTO generated_files 
+                    (id, conversation_id, file_type, file_name, file_path, file_size, mime_type, prompt, metadata, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                 (file_id, conversation_id, file_type, file_name, file_path, file_size, 
+                  mime_types.get(file_type, 'application/octet-stream'), prompt, 
+                  json.dumps(metadata) if metadata else '{}', datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+    return file_id
+
+def get_generated_files(file_type=None, limit=50):
+    """Get list of generated files."""
+    conn = get_db()
+    if file_type:
+        rows = conn.execute('SELECT * FROM generated_files WHERE file_type = ? ORDER BY created_at DESC LIMIT ?', 
+                           (file_type, limit)).fetchall()
+    else:
+        rows = conn.execute('SELECT * FROM generated_files ORDER BY created_at DESC LIMIT ?', (limit,)).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+def delete_generated_file(file_id):
+    """Delete a generated file and its record."""
+    conn = get_db()
+    row = conn.execute('SELECT file_path FROM generated_files WHERE id = ?', (file_id,)).fetchone()
+    if row:
+        # Delete physical file
+        full_path = BASE_DIR / row['file_path'].lstrip('/')
+        if full_path.exists():
+            full_path.unlink()
+        # Delete record
+        conn.execute('DELETE FROM generated_files WHERE id = ?', (file_id,))
+        conn.commit()
     conn.close()
 
 init_db()
@@ -689,6 +767,255 @@ def generate_pptx(title, slides_content):
         return None, str(e)
 
 # =============================================================================
+# Audio Generation (Text-to-Speech)
+# =============================================================================
+
+AUDIO_DIR = WORKSPACE_DIR / "audio"
+AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+
+def generate_audio(text, task_id=None, lang='en'):
+    """Generate audio from text using gTTS."""
+    try:
+        if task_id:
+            task_manager.update_task(task_id, step=1, step_name='Initializing text-to-speech...', progress=10)
+        
+        from gtts import gTTS
+        
+        if task_manager and task_id and task_manager.is_cancelled(task_id):
+            return None, "Cancelled"
+        
+        if task_id:
+            task_manager.update_task(task_id, step=2, step_name='Converting text to speech...', progress=30)
+        
+        # Create audio
+        tts = gTTS(text=text, lang=lang, slow=False)
+        
+        if task_id:
+            task_manager.update_task(task_id, step=3, step_name='Saving audio file...', progress=70)
+        
+        filename = f"audio_{uuid.uuid4().hex[:8]}.mp3"
+        filepath = AUDIO_DIR / filename
+        tts.save(str(filepath))
+        
+        # Save to database
+        save_generated_file('audio', filename, f"/audio/{filename}", text[:200])
+        
+        if task_id:
+            task_manager.update_task(task_id, step=4, step_name='Complete!', progress=100, status='completed', 
+                                    result={'url': f"/audio/{filename}", 'filename': filename})
+        
+        return f"/audio/{filename}", filename
+    except Exception as e:
+        print(f"[Audio] Generation error: {e}")
+        if task_id:
+            task_manager.update_task(task_id, status='error', error=str(e))
+        return None, str(e)
+
+# =============================================================================
+# QR Code Generation
+# =============================================================================
+
+def generate_qrcode(data, task_id=None):
+    """Generate QR code image."""
+    try:
+        if task_id:
+            task_manager.update_task(task_id, step=1, step_name='Creating QR code...', progress=30)
+        
+        import qrcode
+        from qrcode.image.styledpil import StyledPilImage
+        from qrcode.image.styles.moduledrawers import RoundedModuleDrawer
+        from qrcode.image.styles.colormasks import RadialGradiantColorMask
+        
+        qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=4)
+        qr.add_data(data)
+        qr.make(fit=True)
+        
+        if task_id:
+            task_manager.update_task(task_id, step=2, step_name='Styling QR code...', progress=60)
+        
+        # Create styled QR code with gradient
+        try:
+            img = qr.make_image(
+                image_factory=StyledPilImage,
+                module_drawer=RoundedModuleDrawer(),
+                color_mask=RadialGradiantColorMask(
+                    back_color=(255, 255, 255),
+                    center_color=(139, 92, 246),
+                    edge_color=(236, 72, 153)
+                )
+            )
+        except:
+            # Fallback to simple QR
+            img = qr.make_image(fill_color="#8b5cf6", back_color="white")
+        
+        if task_id:
+            task_manager.update_task(task_id, step=3, step_name='Saving image...', progress=90)
+        
+        filename = f"qr_{uuid.uuid4().hex[:8]}.png"
+        filepath = GALLERY_DIR / filename
+        img.save(str(filepath))
+        
+        save_generated_file('qr', filename, f"/gallery/{filename}", data[:200])
+        
+        if task_id:
+            task_manager.update_task(task_id, step=4, step_name='Complete!', progress=100, status='completed',
+                                    result={'url': f"/gallery/{filename}", 'filename': filename})
+        
+        return f"/gallery/{filename}", filename
+    except Exception as e:
+        print(f"[QR] Generation error: {e}")
+        if task_id:
+            task_manager.update_task(task_id, status='error', error=str(e))
+        return None, str(e)
+
+# =============================================================================
+# Chart Generation
+# =============================================================================
+
+def generate_chart(chart_type, data, title="Chart", task_id=None):
+    """Generate chart/graph image."""
+    try:
+        if task_id:
+            task_manager.update_task(task_id, step=1, step_name='Setting up chart...', progress=20)
+        
+        import matplotlib
+        matplotlib.use('Agg')  # Non-interactive backend
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        # Set dark theme
+        plt.style.use('dark_background')
+        fig, ax = plt.subplots(figsize=(10, 6), facecolor='#12121a')
+        ax.set_facecolor('#1a1a25')
+        
+        if task_id:
+            task_manager.update_task(task_id, step=2, step_name='Creating visualization...', progress=50)
+        
+        # Parse data if it's a string
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except:
+                # Try to parse as simple format: "label1:value1,label2:value2"
+                data = {}
+                for item in data.split(','):
+                    if ':' in item:
+                        k, v = item.split(':', 1)
+                        try:
+                            data[k.strip()] = float(v.strip())
+                        except:
+                            data[k.strip()] = v.strip()
+        
+        labels = list(data.keys()) if isinstance(data, dict) else [f"Item {i+1}" for i in range(len(data))]
+        values = list(data.values()) if isinstance(data, dict) else data
+        
+        # Gradient colors
+        colors = plt.cm.plasma(np.linspace(0.2, 0.8, len(labels)))
+        
+        if chart_type == 'bar':
+            bars = ax.bar(labels, values, color=colors, edgecolor='white', linewidth=0.5)
+            ax.set_xlabel('Categories', color='#a0a0b0')
+            ax.set_ylabel('Values', color='#a0a0b0')
+        elif chart_type == 'pie':
+            wedges, texts, autotexts = ax.pie(values, labels=labels, autopct='%1.1f%%', colors=colors,
+                                              textprops={'color': 'white'}, wedgeprops={'edgecolor': '#12121a'})
+        elif chart_type == 'line':
+            ax.plot(labels, values, color='#8b5cf6', linewidth=2, marker='o', markersize=8,
+                   markerfacecolor='#ec4899', markeredgecolor='white')
+            ax.fill_between(labels, values, alpha=0.3, color='#8b5cf6')
+            ax.set_xlabel('X', color='#a0a0b0')
+            ax.set_ylabel('Y', color='#a0a0b0')
+        else:
+            ax.bar(labels, values, color=colors)
+        
+        ax.set_title(title, color='white', fontsize=14, fontweight='bold', pad=20)
+        ax.tick_params(colors='#606070')
+        for spine in ax.spines.values():
+            spine.set_color('#2a2a35')
+        
+        plt.tight_layout()
+        
+        if task_id:
+            task_manager.update_task(task_id, step=3, step_name='Saving chart...', progress=85)
+        
+        filename = f"chart_{uuid.uuid4().hex[:8]}.png"
+        filepath = GALLERY_DIR / filename
+        plt.savefig(str(filepath), dpi=150, facecolor='#12121a', edgecolor='none', bbox_inches='tight')
+        plt.close()
+        
+        save_generated_file('chart', filename, f"/gallery/{filename}", f"{chart_type}: {title}")
+        
+        if task_id:
+            task_manager.update_task(task_id, step=4, step_name='Complete!', progress=100, status='completed',
+                                    result={'url': f"/gallery/{filename}", 'filename': filename})
+        
+        return f"/gallery/{filename}", filename
+    except Exception as e:
+        print(f"[Chart] Generation error: {e}")
+        if task_id:
+            task_manager.update_task(task_id, status='error', error=str(e))
+        return None, str(e)
+
+# =============================================================================
+# Excel Generation
+# =============================================================================
+
+def generate_excel(data, title="Spreadsheet", task_id=None):
+    """Generate Excel spreadsheet."""
+    try:
+        if task_id:
+            task_manager.update_task(task_id, step=1, step_name='Creating spreadsheet...', progress=30)
+        
+        import pandas as pd
+        
+        # Parse data
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except:
+                # Create from text (each line is a row, comma-separated)
+                rows = [line.split(',') for line in data.strip().split('\n')]
+                if rows:
+                    headers = rows[0] if len(rows) > 1 else [f"Col{i+1}" for i in range(len(rows[0]))]
+                    data = {headers[i]: [row[i] if i < len(row) else '' for row in rows[1:]] for i in range(len(headers))}
+        
+        df = pd.DataFrame(data)
+        
+        if task_id:
+            task_manager.update_task(task_id, step=2, step_name='Formatting...', progress=60)
+        
+        filename = f"spreadsheet_{uuid.uuid4().hex[:8]}.xlsx"
+        filepath = DOCUMENT_DIR / filename
+        
+        # Save with formatting
+        with pd.ExcelWriter(str(filepath), engine='xlsxwriter') as writer:
+            df.to_excel(writer, sheet_name='Data', index=False)
+            workbook = writer.book
+            worksheet = writer.sheets['Data']
+            
+            # Format header
+            header_format = workbook.add_format({
+                'bold': True, 'bg_color': '#8b5cf6', 'font_color': 'white',
+                'border': 1, 'align': 'center'
+            })
+            for col_num, col_name in enumerate(df.columns):
+                worksheet.write(0, col_num, col_name, header_format)
+                worksheet.set_column(col_num, col_num, max(len(str(col_name)), 12))
+        
+        save_generated_file('xlsx', filename, f"/documents/{filename}", title)
+        
+        if task_id:
+            task_manager.update_task(task_id, step=3, step_name='Complete!', progress=100, status='completed',
+                                    result={'url': f"/documents/{filename}", 'filename': filename})
+        
+        return f"/documents/{filename}", filename
+    except Exception as e:
+        print(f"[Excel] Generation error: {e}")
+        if task_id:
+            task_manager.update_task(task_id, status='error', error=str(e))
+        return None, str(e)
+
+# =============================================================================
 # API Routes
 # =============================================================================
 
@@ -1067,6 +1394,179 @@ def stream_chat():
             yield f"data: {json.dumps({'done': True})}\n\n"
             return
         
+        # Audio/Speech generation
+        if any(phrase in lower_msg for phrase in ['generate audio', 'create audio', 'text to speech', 'read aloud', 'speak this', 'say this']):
+            task_id = task_manager.create_task('audio_generation')
+            yield f"data: {json.dumps({'task_start': {'id': task_id, 'type': 'audio', 'title': '🔊 Audio Generation', 'steps': ['Initializing TTS', 'Converting text', 'Generating audio', 'Saving file']}})}\n\n"
+            
+            # Extract text to convert (remove command phrases)
+            text_to_speak = message
+            for phrase in ['generate audio', 'create audio', 'text to speech', 'read aloud', 'speak this', 'say this', 'for', 'of', ':']:
+                text_to_speak = text_to_speak.lower().replace(phrase, '').strip()
+            if not text_to_speak or len(text_to_speak) < 5:
+                text_to_speak = message
+            
+            def run_audio():
+                generate_audio(text_to_speak, task_id)
+            
+            thread = threading.Thread(target=run_audio)
+            thread.start()
+            
+            last_progress = -1
+            while thread.is_alive():
+                task = task_manager.get_task(task_id)
+                if task.get('progress', 0) != last_progress:
+                    yield f"data: {json.dumps({'task_progress': task})}\n\n"
+                    last_progress = task.get('progress', 0)
+                time.sleep(0.1)
+            
+            thread.join()
+            task = task_manager.get_task(task_id)
+            
+            if task.get('status') == 'completed' and task.get('result'):
+                yield f"data: {json.dumps({'audio': task['result']['url'], 'audio_name': task['result']['filename']})}\n\n"
+                yield f"data: {json.dumps({'content': '✅ Audio generated! Click play to listen.'})}\n\n"
+            else:
+                error_msg = task.get('error', 'Unknown error')
+                yield f"data: {json.dumps({'content': f'❌ Failed: {error_msg}'})}\n\n"
+            
+            yield f"data: {json.dumps({'task_complete': task_id})}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+            return
+        
+        # QR Code generation
+        if any(phrase in lower_msg for phrase in ['generate qr', 'create qr', 'make qr', 'qr code']):
+            task_id = task_manager.create_task('qr_generation')
+            yield f"data: {json.dumps({'task_start': {'id': task_id, 'type': 'image', 'title': '📱 QR Code Generation', 'steps': ['Creating QR code', 'Styling', 'Saving image']}})}\n\n"
+            
+            # Extract data for QR code
+            qr_data = message
+            for phrase in ['generate qr', 'create qr', 'make qr', 'qr code', 'for', 'of', 'with', ':']:
+                qr_data = qr_data.lower().replace(phrase, '').strip()
+            if not qr_data:
+                qr_data = "https://github.com/LA-Rich/UltimateChat"
+            
+            def run_qr():
+                generate_qrcode(qr_data, task_id)
+            
+            thread = threading.Thread(target=run_qr)
+            thread.start()
+            
+            while thread.is_alive():
+                task = task_manager.get_task(task_id)
+                yield f"data: {json.dumps({'task_progress': task})}\n\n"
+                time.sleep(0.1)
+            
+            thread.join()
+            task = task_manager.get_task(task_id)
+            
+            if task.get('status') == 'completed' and task.get('result'):
+                yield f"data: {json.dumps({'image': task['result']['url']})}\n\n"
+                yield f"data: {json.dumps({'content': '✅ QR code generated!'})}\n\n"
+            else:
+                error_msg = task.get('error', 'Unknown error')
+                yield f"data: {json.dumps({'content': f'❌ Failed: {error_msg}'})}\n\n"
+            
+            yield f"data: {json.dumps({'task_complete': task_id})}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+            return
+        
+        # Chart generation
+        if any(phrase in lower_msg for phrase in ['generate chart', 'create chart', 'make chart', 'create graph', 'bar chart', 'pie chart', 'line chart']):
+            task_id = task_manager.create_task('chart_generation')
+            yield f"data: {json.dumps({'task_start': {'id': task_id, 'type': 'image', 'title': '📊 Chart Generation', 'steps': ['Setting up', 'Creating visualization', 'Rendering', 'Saving']}})}\n\n"
+            
+            # Determine chart type
+            chart_type = 'bar'
+            if 'pie' in lower_msg:
+                chart_type = 'pie'
+            elif 'line' in lower_msg:
+                chart_type = 'line'
+            
+            # Try to extract data
+            chart_data = {'Sample A': 30, 'Sample B': 45, 'Sample C': 25, 'Sample D': 60, 'Sample E': 35}
+            chart_title = 'Generated Chart'
+            
+            # Look for data in format "label:value,label:value"
+            import re
+            data_match = re.search(r'data[:\s]+([^\n]+)', message, re.IGNORECASE)
+            if data_match:
+                try:
+                    data_str = data_match.group(1)
+                    chart_data = {}
+                    for item in data_str.split(','):
+                        if ':' in item:
+                            k, v = item.split(':', 1)
+                            chart_data[k.strip()] = float(v.strip())
+                except:
+                    pass
+            
+            title_match = re.search(r'title[:\s]+([^\n,]+)', message, re.IGNORECASE)
+            if title_match:
+                chart_title = title_match.group(1).strip()
+            
+            def run_chart():
+                generate_chart(chart_type, chart_data, chart_title, task_id)
+            
+            thread = threading.Thread(target=run_chart)
+            thread.start()
+            
+            while thread.is_alive():
+                task = task_manager.get_task(task_id)
+                yield f"data: {json.dumps({'task_progress': task})}\n\n"
+                time.sleep(0.1)
+            
+            thread.join()
+            task = task_manager.get_task(task_id)
+            
+            if task.get('status') == 'completed' and task.get('result'):
+                yield f"data: {json.dumps({'image': task['result']['url']})}\n\n"
+                yield f"data: {json.dumps({'content': f'✅ {chart_type.title()} chart generated!'})}\n\n"
+            else:
+                error_msg = task.get('error', 'Unknown error')
+                yield f"data: {json.dumps({'content': f'❌ Failed: {error_msg}'})}\n\n"
+            
+            yield f"data: {json.dumps({'task_complete': task_id})}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+            return
+        
+        # Excel generation
+        if any(phrase in lower_msg for phrase in ['generate excel', 'create excel', 'create spreadsheet', 'make spreadsheet', 'generate xlsx']):
+            task_id = task_manager.create_task('excel_generation')
+            yield f"data: {json.dumps({'task_start': {'id': task_id, 'type': 'document', 'title': '📊 Excel Generation', 'steps': ['Creating spreadsheet', 'Formatting', 'Saving']}})}\n\n"
+            
+            # Default sample data
+            excel_data = {
+                'Name': ['Item 1', 'Item 2', 'Item 3', 'Item 4'],
+                'Value': [100, 200, 150, 300],
+                'Category': ['A', 'B', 'A', 'C']
+            }
+            
+            def run_excel():
+                generate_excel(excel_data, "Generated Spreadsheet", task_id)
+            
+            thread = threading.Thread(target=run_excel)
+            thread.start()
+            
+            while thread.is_alive():
+                task = task_manager.get_task(task_id)
+                yield f"data: {json.dumps({'task_progress': task})}\n\n"
+                time.sleep(0.1)
+            
+            thread.join()
+            task = task_manager.get_task(task_id)
+            
+            if task.get('status') == 'completed' and task.get('result'):
+                yield f"data: {json.dumps({'document': task['result']['url'], 'document_name': task['result']['filename']})}\n\n"
+                yield f"data: {json.dumps({'content': '✅ Excel spreadsheet generated!'})}\n\n"
+            else:
+                error_msg = task.get('error', 'Unknown error')
+                yield f"data: {json.dumps({'content': f'❌ Failed: {error_msg}'})}\n\n"
+            
+            yield f"data: {json.dumps({'task_complete': task_id})}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+            return
+        
         # Stream LLM response using selected provider
         yield f"data: {json.dumps({'model_info': {'provider': provider, 'model': model}})}\n\n"
         
@@ -1132,6 +1632,25 @@ def serve_video(filename):
 def serve_document(filename):
     """Serve generated documents."""
     return send_from_directory(str(DOCUMENT_DIR), filename)
+
+@app.route('/audio/<filename>')
+def serve_audio(filename):
+    """Serve generated audio files."""
+    return send_from_directory(str(AUDIO_DIR), filename)
+
+@app.route('/api/gallery', methods=['GET'])
+def get_gallery():
+    """Get all generated files."""
+    file_type = request.args.get('type')
+    limit = int(request.args.get('limit', 50))
+    files = get_generated_files(file_type, limit)
+    return jsonify(files)
+
+@app.route('/api/gallery/<file_id>', methods=['DELETE'])
+def delete_gallery_file(file_id):
+    """Delete a generated file."""
+    delete_generated_file(file_id)
+    return jsonify({'success': True})
 
 @app.route('/static/<path:filename>')
 def serve_static(filename):
@@ -1262,6 +1781,161 @@ HTML_TEMPLATE = '''
         .new-chat-btn:hover {
             transform: translateY(-2px);
             box-shadow: var(--shadow-glow);
+        }
+
+        /* Sidebar Tabs */
+        .sidebar-tabs {
+            display: flex;
+            padding: 8px;
+            gap: 4px;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .sidebar-tab {
+            flex: 1;
+            padding: 10px 12px;
+            background: transparent;
+            border: none;
+            border-radius: var(--radius-sm);
+            color: var(--text-muted);
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .sidebar-tab:hover {
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+        }
+        .sidebar-tab.active {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+        }
+        
+        .sidebar-panel {
+            flex: 1;
+            overflow-y: auto;
+            display: none;
+        }
+        .sidebar-panel.active {
+            display: flex;
+            flex-direction: column;
+        }
+        
+        /* Gallery */
+        .gallery-filters {
+            display: flex;
+            padding: 8px;
+            gap: 4px;
+            flex-wrap: wrap;
+        }
+        
+        .filter-btn {
+            padding: 6px 12px;
+            background: var(--bg-tertiary);
+            border: 1px solid transparent;
+            border-radius: var(--radius-sm);
+            color: var(--text-muted);
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .filter-btn:hover {
+            border-color: var(--border);
+        }
+        .filter-btn.active {
+            background: var(--accent);
+            color: white;
+        }
+        
+        .gallery-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 8px;
+            padding: 8px;
+            overflow-y: auto;
+        }
+        
+        .gallery-item {
+            aspect-ratio: 1;
+            border-radius: var(--radius-sm);
+            overflow: hidden;
+            cursor: pointer;
+            position: relative;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            transition: all 0.2s;
+        }
+        .gallery-item:hover {
+            border-color: var(--accent);
+            transform: scale(1.02);
+        }
+        
+        .gallery-item img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        
+        .gallery-item-icon {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 32px;
+            background: var(--bg-secondary);
+        }
+        
+        .gallery-item-overlay {
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(to top, rgba(0,0,0,0.8), transparent);
+            opacity: 0;
+            transition: opacity 0.2s;
+            display: flex;
+            align-items: flex-end;
+            padding: 8px;
+        }
+        .gallery-item:hover .gallery-item-overlay {
+            opacity: 1;
+        }
+        
+        .gallery-item-name {
+            font-size: 11px;
+            color: white;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        
+        .gallery-item-delete {
+            position: absolute;
+            top: 4px;
+            right: 4px;
+            width: 24px;
+            height: 24px;
+            background: rgba(239, 68, 68, 0.9);
+            border: none;
+            border-radius: 50%;
+            color: white;
+            font-size: 12px;
+            cursor: pointer;
+            opacity: 0;
+            transition: opacity 0.2s;
+        }
+        .gallery-item:hover .gallery-item-delete {
+            opacity: 1;
+        }
+        
+        .gallery-empty {
+            grid-column: 1 / -1;
+            padding: 40px 20px;
+            text-align: center;
+            color: var(--text-muted);
+        }
+        .gallery-empty-icon {
+            font-size: 48px;
+            margin-bottom: 12px;
         }
 
         .conversations-list {
@@ -1646,8 +2320,39 @@ HTML_TEMPLATE = '''
         .welcome-subtitle {
             font-size: 16px;
             color: var(--text-secondary);
+            margin-bottom: 24px;
+            max-width: 500px;
+        }
+        
+        .capabilities-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            justify-content: center;
             margin-bottom: 32px;
-            max-width: 400px;
+            max-width: 600px;
+        }
+        
+        .capability-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+        
+        .capability-icon {
+            font-size: 16px;
+        }
+        
+        .welcome-hint {
+            font-size: 14px;
+            color: var(--text-muted);
+            margin-bottom: 16px;
         }
 
         .quick-prompts {
@@ -2113,6 +2818,103 @@ HTML_TEMPLATE = '''
         .document-icon {
             font-size: 24px;
         }
+        
+        /* Generated File Card */
+        .generated-file-card {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            padding: 16px 20px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            margin: 12px 0;
+            transition: all 0.2s;
+        }
+        .generated-file-card:hover {
+            border-color: var(--accent);
+            box-shadow: 0 4px 20px rgba(139, 92, 246, 0.1);
+        }
+        
+        .file-icon {
+            font-size: 32px;
+            width: 48px;
+            height: 48px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: var(--bg-secondary);
+            border-radius: var(--radius-sm);
+        }
+        
+        .file-info {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        
+        .file-name {
+            font-weight: 500;
+            color: var(--text-primary);
+        }
+        
+        .file-type {
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+        
+        .file-download-btn {
+            padding: 10px 16px;
+            background: var(--gradient-1);
+            border: none;
+            border-radius: var(--radius-sm);
+            color: white;
+            font-size: 14px;
+            text-decoration: none;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        .file-download-btn:hover {
+            transform: scale(1.05);
+        }
+        
+        /* Audio Card */
+        .generated-audio-card {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            padding: 16px 20px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            margin: 12px 0;
+        }
+        
+        .audio-icon {
+            font-size: 28px;
+            width: 48px;
+            height: 48px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, #10b981 0%, #3b82f6 100%);
+            border-radius: 50%;
+        }
+        
+        .audio-player-wrapper {
+            flex: 1;
+        }
+        
+        .audio-player {
+            width: 100%;
+            height: 40px;
+            border-radius: 20px;
+        }
+        
+        .audio-player::-webkit-media-controls-panel {
+            background: var(--bg-secondary);
+        }
 
         /* Input Area */
         .input-area {
@@ -2404,8 +3206,35 @@ HTML_TEMPLATE = '''
                 <span>✨</span> New Chat
             </button>
             
-            <div class="conversations-list" id="conversations-list">
-                <!-- Conversations loaded dynamically -->
+            <!-- Sidebar Tabs -->
+            <div class="sidebar-tabs">
+                <button class="sidebar-tab active" onclick="switchSidebarTab('chats')" data-tab="chats">
+                    💬 Chats
+                </button>
+                <button class="sidebar-tab" onclick="switchSidebarTab('gallery')" data-tab="gallery">
+                    🖼️ Gallery
+                </button>
+            </div>
+            
+            <!-- Chats Panel -->
+            <div class="sidebar-panel active" id="panel-chats">
+                <div class="conversations-list" id="conversations-list">
+                    <!-- Conversations loaded dynamically -->
+                </div>
+            </div>
+            
+            <!-- Gallery Panel -->
+            <div class="sidebar-panel" id="panel-gallery">
+                <div class="gallery-filters">
+                    <button class="filter-btn active" onclick="filterGallery(null)">All</button>
+                    <button class="filter-btn" onclick="filterGallery('image')">🖼️</button>
+                    <button class="filter-btn" onclick="filterGallery('audio')">🔊</button>
+                    <button class="filter-btn" onclick="filterGallery('pdf')">📄</button>
+                    <button class="filter-btn" onclick="filterGallery('chart')">📊</button>
+                </div>
+                <div class="gallery-grid" id="gallery-grid">
+                    <!-- Gallery items loaded dynamically -->
+                </div>
             </div>
         </aside>
 
@@ -2437,24 +3266,63 @@ HTML_TEMPLATE = '''
                     <div class="welcome-icon">🚀</div>
                     <h2 class="welcome-title">Welcome to Ultimate Chat</h2>
                     <p class="welcome-subtitle">
-                        Your AI-powered assistant for coding, writing, image generation, and more.
+                        Your all-in-one AI assistant. Chat with multiple AI models, generate images, audio, documents, and more.
                     </p>
+                    
+                    <!-- Capabilities Grid -->
+                    <div class="capabilities-grid">
+                        <div class="capability-item">
+                            <span class="capability-icon">💬</span>
+                            <span>Multi-Model Chat</span>
+                        </div>
+                        <div class="capability-item">
+                            <span class="capability-icon">🎨</span>
+                            <span>Image Generation</span>
+                        </div>
+                        <div class="capability-item">
+                            <span class="capability-icon">🔊</span>
+                            <span>Text to Speech</span>
+                        </div>
+                        <div class="capability-item">
+                            <span class="capability-icon">📊</span>
+                            <span>Charts & Graphs</span>
+                        </div>
+                        <div class="capability-item">
+                            <span class="capability-icon">📱</span>
+                            <span>QR Codes</span>
+                        </div>
+                        <div class="capability-item">
+                            <span class="capability-icon">📄</span>
+                            <span>PDF/Word/Excel</span>
+                        </div>
+                    </div>
+                    
+                    <p class="welcome-hint">Try these commands to get started:</p>
+                    
                     <div class="quick-prompts">
-                        <div class="quick-prompt" onclick="sendQuickPrompt('Explain quantum computing in simple terms')">
+                        <div class="quick-prompt" onclick="sendQuickPrompt('Explain how neural networks work')">
                             <div class="quick-prompt-icon">🧠</div>
-                            <div class="quick-prompt-text">Explain quantum computing in simple terms</div>
+                            <div class="quick-prompt-text">Explain neural networks</div>
                         </div>
-                        <div class="quick-prompt" onclick="sendQuickPrompt('Write a Python function to sort a list')">
-                            <div class="quick-prompt-icon">💻</div>
-                            <div class="quick-prompt-text">Write a Python function to sort a list</div>
+                        <div class="quick-prompt" onclick="sendQuickPrompt('Generate audio: Welcome to Ultimate Chat, your all-in-one AI assistant!')">
+                            <div class="quick-prompt-icon">🔊</div>
+                            <div class="quick-prompt-text">Generate audio greeting</div>
                         </div>
-                        <div class="quick-prompt" onclick="sendQuickPrompt('Generate an image of a sunset over mountains')">
-                            <div class="quick-prompt-icon">🎨</div>
-                            <div class="quick-prompt-text">Generate an image of a sunset</div>
+                        <div class="quick-prompt" onclick="sendQuickPrompt('Create a bar chart with data: Sales:150, Marketing:80, Development:200, Support:60')">
+                            <div class="quick-prompt-icon">📊</div>
+                            <div class="quick-prompt-text">Create a bar chart</div>
                         </div>
-                        <div class="quick-prompt" onclick="sendQuickPrompt('Create a PDF report about climate change')">
-                            <div class="quick-prompt-icon">📄</div>
+                        <div class="quick-prompt" onclick="sendQuickPrompt('Generate QR code for https://github.com')">
+                            <div class="quick-prompt-icon">📱</div>
+                            <div class="quick-prompt-text">Generate a QR code</div>
+                        </div>
+                        <div class="quick-prompt" onclick="sendQuickPrompt('Create a PDF summary of the benefits of AI in healthcare')">
+                            <div class="quick-prompt-icon">📕</div>
                             <div class="quick-prompt-text">Create a PDF document</div>
+                        </div>
+                        <div class="quick-prompt" onclick="sendQuickPrompt('Generate Excel spreadsheet with sample sales data')">
+                            <div class="quick-prompt-icon">📗</div>
+                            <div class="quick-prompt-text">Generate spreadsheet</div>
                         </div>
                     </div>
                 </div>
@@ -3123,10 +3991,34 @@ HTML_TEMPLATE = '''
                                 }
                                 
                                 if (data.document) {
-                                    fullContent += `\\n\\n<a href="${data.document}" download class="document-link">
-                                        <span class="document-icon">📄</span>
-                                        <span>${data.document_name || 'Download Document'}</span>
-                                    </a>`;
+                                    const ext = (data.document_name || '').split('.').pop().toLowerCase();
+                                    const icons = {pdf: '📕', docx: '📘', pptx: '📙', xlsx: '📗'};
+                                    const icon = icons[ext] || '📄';
+                                    fullContent += `\\n\\n<div class="generated-file-card">
+                                        <div class="file-icon">${icon}</div>
+                                        <div class="file-info">
+                                            <span class="file-name">${data.document_name || 'Document'}</span>
+                                            <span class="file-type">${ext.toUpperCase()} Document</span>
+                                        </div>
+                                        <a href="${data.document}" download class="file-download-btn">⬇️ Download</a>
+                                    </div>`;
+                                    const streamingMsg = document.getElementById('streaming-message');
+                                    if (streamingMsg) {
+                                        const body = streamingMsg.querySelector('.message-body');
+                                        body.innerHTML = marked.parse(fullContent);
+                                    }
+                                }
+                                
+                                if (data.audio) {
+                                    fullContent += `\\n\\n<div class="generated-audio-card">
+                                        <div class="audio-icon">🔊</div>
+                                        <div class="audio-player-wrapper">
+                                            <audio controls class="audio-player" src="${data.audio}">
+                                                Your browser does not support audio.
+                                            </audio>
+                                        </div>
+                                        <a href="${data.audio}" download="${data.audio_name || 'audio.mp3'}" class="file-download-btn">⬇️</a>
+                                    </div>`;
                                     const streamingMsg = document.getElementById('streaming-message');
                                     if (streamingMsg) {
                                         const body = streamingMsg.querySelector('.message-body');
@@ -3515,6 +4407,106 @@ HTML_TEMPLATE = '''
 
         function closeSidebar() {
             document.getElementById('sidebar').classList.remove('open');
+        }
+        
+        // =============================================================================
+        // Sidebar Tabs & Gallery
+        // =============================================================================
+        
+        let currentGalleryFilter = null;
+        
+        function switchSidebarTab(tabName) {
+            document.querySelectorAll('.sidebar-tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.sidebar-panel').forEach(p => p.classList.remove('active'));
+            
+            document.querySelector(`.sidebar-tab[data-tab="${tabName}"]`).classList.add('active');
+            document.getElementById(`panel-${tabName}`).classList.add('active');
+            
+            if (tabName === 'gallery') {
+                loadGallery();
+            }
+        }
+        
+        async function loadGallery(fileType = null) {
+            currentGalleryFilter = fileType;
+            const grid = document.getElementById('gallery-grid');
+            
+            try {
+                const url = fileType ? `/api/gallery?type=${fileType}` : '/api/gallery';
+                const response = await fetch(url);
+                const files = await response.json();
+                
+                if (files.length === 0) {
+                    grid.innerHTML = `
+                        <div class="gallery-empty">
+                            <div class="gallery-empty-icon">📁</div>
+                            <div>No files yet</div>
+                            <div style="font-size: 12px; margin-top: 8px;">
+                                Try generating images, audio, or documents!
+                            </div>
+                        </div>
+                    `;
+                    return;
+                }
+                
+                grid.innerHTML = files.map(file => {
+                    const isImage = ['image', 'qr', 'chart'].includes(file.file_type);
+                    const icons = {
+                        audio: '🔊', pdf: '📕', docx: '📘', pptx: '📙', xlsx: '📗', 
+                        image: '🖼️', qr: '📱', chart: '📊'
+                    };
+                    
+                    return `
+                        <div class="gallery-item" onclick="openGalleryItem('${file.file_path}', '${file.file_type}')">
+                            ${isImage 
+                                ? `<img src="${file.file_path}" alt="${file.file_name}" loading="lazy">`
+                                : `<div class="gallery-item-icon">${icons[file.file_type] || '📄'}</div>`
+                            }
+                            <div class="gallery-item-overlay">
+                                <span class="gallery-item-name">${file.file_name}</span>
+                            </div>
+                            <button class="gallery-item-delete" onclick="event.stopPropagation(); deleteGalleryItem('${file.id}')">×</button>
+                        </div>
+                    `;
+                }).join('');
+                
+            } catch (e) {
+                console.error('Failed to load gallery:', e);
+                grid.innerHTML = '<div class="gallery-empty">Failed to load gallery</div>';
+            }
+        }
+        
+        function filterGallery(fileType) {
+            document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+            event.target.classList.add('active');
+            loadGallery(fileType);
+        }
+        
+        function openGalleryItem(path, type) {
+            if (['image', 'qr', 'chart'].includes(type)) {
+                openLightbox(path);
+            } else if (type === 'audio') {
+                // Play audio in a modal or just open
+                window.open(path, '_blank');
+            } else {
+                // Download document
+                const a = document.createElement('a');
+                a.href = path;
+                a.download = '';
+                a.click();
+            }
+        }
+        
+        async function deleteGalleryItem(fileId) {
+            if (!confirm('Delete this file?')) return;
+            
+            try {
+                await fetch(`/api/gallery/${fileId}`, { method: 'DELETE' });
+                loadGallery(currentGalleryFilter);
+                showToast('File deleted', 'success');
+            } catch (e) {
+                showToast('Failed to delete file', 'error');
+            }
         }
     </script>
 </body>
