@@ -447,7 +447,24 @@ def stream_openai(messages, model, api_key, base_url=None):
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
     
     req = urllib.request.Request(url, json.dumps(payload).encode('utf-8'), headers, method='POST')
-    with urllib.request.urlopen(req, timeout=120) as response:
+    
+    try:
+        response = urllib.request.urlopen(req, timeout=120)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            yield "\n\n⚠️ **Rate Limited by OpenAI.** Wait a moment and try again, or switch to another provider."
+            return
+        elif e.code == 401:
+            yield "\n\n❌ **Invalid OpenAI API Key.** Please check your API key in Settings ⚙️"
+            return
+        else:
+            yield f"\n\n❌ **OpenAI API Error ({e.code}):** {e.reason}"
+            return
+    except Exception as e:
+        yield f"\n\n❌ **Connection Error:** {str(e)}"
+        return
+    
+    with response:
         buffer = ""
         for chunk in iter(lambda: response.read(1024), b''):
             buffer += chunk.decode('utf-8')
@@ -472,7 +489,23 @@ def stream_anthropic(messages, model, api_key):
     headers = {"Content-Type": "application/json", "x-api-key": api_key, "anthropic-version": "2023-06-01"}
     req = urllib.request.Request(url, json.dumps(payload).encode('utf-8'), headers, method='POST')
     
-    with urllib.request.urlopen(req, timeout=120) as response:
+    try:
+        response = urllib.request.urlopen(req, timeout=120)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            yield "\n\n⚠️ **Rate Limited by Anthropic.** Wait a moment and try again, or switch to another provider."
+            return
+        elif e.code == 401:
+            yield "\n\n❌ **Invalid Anthropic API Key.** Please check your API key in Settings ⚙️"
+            return
+        else:
+            yield f"\n\n❌ **Anthropic API Error ({e.code}):** {e.reason}"
+            return
+    except Exception as e:
+        yield f"\n\n❌ **Connection Error:** {str(e)}"
+        return
+    
+    with response:
         buffer = ""
         for chunk in iter(lambda: response.read(1024), b''):
             buffer += chunk.decode('utf-8')
@@ -504,7 +537,23 @@ def stream_google(messages, model, api_key):
     headers = {"Content-Type": "application/json"}
     req = urllib.request.Request(url, json.dumps(payload).encode('utf-8'), headers, method='POST')
     
-    with urllib.request.urlopen(req, timeout=120) as response:
+    try:
+        response = urllib.request.urlopen(req, timeout=120)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            yield "\n\n⚠️ **Rate Limited by Google.** Try switching to another provider (OpenAI, Claude, or Ollama) in the model selector."
+            return
+        elif e.code == 401 or e.code == 403:
+            yield "\n\n❌ **Invalid Google API Key.** Please check your API key in Settings ⚙️"
+            return
+        else:
+            yield f"\n\n❌ **Google API Error ({e.code}):** {e.reason}"
+            return
+    except Exception as e:
+        yield f"\n\n❌ **Connection Error:** {str(e)}"
+        return
+    
+    with response:
         buffer = ""
         for chunk in iter(lambda: response.read(1024), b''):
             buffer += chunk.decode('utf-8')
@@ -1416,8 +1465,8 @@ def get_settings():
     
     return jsonify({
         'api_keys': masked,
-        'current_provider': get_setting('current_provider', 'google'),
-        'current_model': get_setting('current_model', 'gemini-2.5-pro'),
+        'current_provider': get_setting('current_provider', 'openai'),
+        'current_model': get_setting('current_model', 'gpt-4o-mini'),
         'custom_models': get_custom_models()
     })
 
@@ -1639,7 +1688,7 @@ def stream_chat():
         return jsonify({'error': 'No conversation ID'}), 400
     
     # Use request-specified or saved settings
-    provider = req_provider or get_setting('current_provider', 'google')
+    provider = req_provider or get_setting('current_provider', 'openai')
     model = req_model or get_setting('current_model', 'gemini-2.5-pro')
     
     def generate():
@@ -4030,8 +4079,8 @@ HTML_TEMPLATE = '''
         let attachments = [];
         let isStreaming = false;
         let providers = {};
-        let currentProvider = 'google';
-        let currentModel = 'gemini-2.5-pro';
+        let currentProvider = 'openai';
+        let currentModel = 'gpt-4o-mini';
         let imageGenEnabled = true;
         let videoGenEnabled = true;
 
@@ -4086,8 +4135,8 @@ HTML_TEMPLATE = '''
             try {
                 const response = await fetch('/api/settings');
                 const settings = await response.json();
-                currentProvider = settings.current_provider || 'google';
-                currentModel = settings.current_model || 'gemini-2.5-pro';
+                currentProvider = settings.current_provider || 'openai';
+                currentModel = settings.current_model || 'gpt-4o-mini';
                 updateModelDisplay();
             } catch (e) { console.error('Failed to load settings:', e); }
         }
