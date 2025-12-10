@@ -11,6 +11,7 @@ import sqlite3
 import traceback
 import urllib.request
 import urllib.error
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -18,6 +19,64 @@ from flask import Flask, request, Response, jsonify, send_from_directory, render
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# =============================================================================
+# Task Manager for Cancellable Operations
+# =============================================================================
+
+class TaskManager:
+    """Manages long-running tasks with cancellation support."""
+    
+    def __init__(self):
+        self.tasks = {}  # task_id -> {status, progress, cancel_flag, result}
+        self.lock = threading.Lock()
+    
+    def create_task(self, task_type):
+        task_id = str(uuid.uuid4())[:8]
+        with self.lock:
+            self.tasks[task_id] = {
+                'type': task_type,
+                'status': 'starting',
+                'progress': 0,
+                'step': 0,
+                'step_name': 'Initializing...',
+                'cancel_requested': False,
+                'result': None,
+                'error': None,
+                'created_at': time.time()
+            }
+        return task_id
+    
+    def update_task(self, task_id, **kwargs):
+        with self.lock:
+            if task_id in self.tasks:
+                self.tasks[task_id].update(kwargs)
+    
+    def get_task(self, task_id):
+        with self.lock:
+            return self.tasks.get(task_id, {}).copy()
+    
+    def cancel_task(self, task_id):
+        with self.lock:
+            if task_id in self.tasks:
+                self.tasks[task_id]['cancel_requested'] = True
+                self.tasks[task_id]['status'] = 'cancelling'
+                return True
+        return False
+    
+    def is_cancelled(self, task_id):
+        with self.lock:
+            return self.tasks.get(task_id, {}).get('cancel_requested', False)
+    
+    def cleanup_old_tasks(self, max_age=3600):
+        """Remove tasks older than max_age seconds."""
+        now = time.time()
+        with self.lock:
+            to_remove = [tid for tid, t in self.tasks.items() if now - t['created_at'] > max_age]
+            for tid in to_remove:
+                del self.tasks[tid]
+
+task_manager = TaskManager()
 
 # =============================================================================
 # Configuration
@@ -409,30 +468,144 @@ def load_sd_pipeline():
         print(f"[SD] Failed to load pipeline: {e}")
         return None
 
+def generate_image_with_progress(prompt, task_id, num_steps=50):
+    """Generate image with progress tracking."""
+    
+    def progress_callback(step, timestep, latents):
+        if task_manager.is_cancelled(task_id):
+            raise InterruptedError("Generation cancelled by user")
+        progress = int((step / num_steps) * 100)
+        task_manager.update_task(task_id, 
+            step=2, 
+            step_name=f'Generating image... Step {step}/{num_steps}',
+            progress=progress,
+            status='running'
+        )
+    
+    task_manager.update_task(task_id, step=1, step_name='Loading Stable Diffusion model...', progress=5)
+    
+    pipeline = load_sd_pipeline()
+    if pipeline is None:
+        task_manager.update_task(task_id, status='error', error='Image generation not available')
+        return None, "Image generation not available"
+    
+    if task_manager.is_cancelled(task_id):
+        task_manager.update_task(task_id, status='cancelled')
+        return None, "Cancelled"
+    
+    try:
+        task_manager.update_task(task_id, step=2, step_name='Starting generation...', progress=10)
+        
+        image = pipeline(
+            prompt, 
+            num_inference_steps=num_steps,
+            callback=progress_callback,
+            callback_steps=1
+        ).images[0]
+        
+        if task_manager.is_cancelled(task_id):
+            task_manager.update_task(task_id, status='cancelled')
+            return None, "Cancelled"
+        
+        task_manager.update_task(task_id, step=3, step_name='Saving to gallery...', progress=95)
+        
+        filename = f"image_{uuid.uuid4().hex[:8]}.png"
+        filepath = GALLERY_DIR / filename
+        image.save(str(filepath))
+        
+        task_manager.update_task(task_id, step=4, step_name='Complete!', progress=100, status='completed', result=f"/gallery/{filename}")
+        
+        return f"/gallery/{filename}", None
+        
+    except InterruptedError:
+        task_manager.update_task(task_id, status='cancelled')
+        return None, "Cancelled"
+    except Exception as e:
+        print(f"[SD] Generation error: {e}")
+        task_manager.update_task(task_id, status='error', error=str(e))
+        return None, str(e)
+
 def generate_image(prompt, num_steps=50):
-    """Generate image from prompt."""
+    """Generate image from prompt (legacy, no progress)."""
     pipeline = load_sd_pipeline()
     if pipeline is None:
         return None, "Image generation not available"
     
     try:
         image = pipeline(prompt, num_inference_steps=num_steps).images[0]
-        
         filename = f"image_{uuid.uuid4().hex[:8]}.png"
         filepath = GALLERY_DIR / filename
         image.save(str(filepath))
-        
         return f"/gallery/{filename}", None
     except Exception as e:
         print(f"[SD] Generation error: {e}")
         return None, str(e)
 
 # =============================================================================
-# Document Generation
+# Document Generation with Progress
 # =============================================================================
 
+def generate_pdf_with_progress(title, content, task_id):
+    """Generate PDF document with progress tracking."""
+    try:
+        task_manager.update_task(task_id, step=1, step_name='Importing PDF libraries...', progress=10)
+        
+        if task_manager.is_cancelled(task_id):
+            return None, "Cancelled"
+        
+        from reportlab.lib.pagesizes import letter
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.units import inch
+        
+        task_manager.update_task(task_id, step=2, step_name='Creating document...', progress=30)
+        
+        filename = f"doc_{uuid.uuid4().hex[:8]}.pdf"
+        filepath = DOCUMENT_DIR / filename
+        
+        if task_manager.is_cancelled(task_id):
+            return None, "Cancelled"
+        
+        task_manager.update_task(task_id, step=3, step_name='Writing content...', progress=50)
+        
+        c = canvas.Canvas(str(filepath), pagesize=letter)
+        width, height = letter
+        
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(inch, height - inch, title)
+        
+        c.setFont("Helvetica", 12)
+        y = height - 1.5 * inch
+        lines = content.split('\n')
+        total_lines = len(lines)
+        
+        for i, line in enumerate(lines):
+            if task_manager.is_cancelled(task_id):
+                return None, "Cancelled"
+            
+            if y < inch:
+                c.showPage()
+                y = height - inch
+            c.drawString(inch, y, line[:80])
+            y -= 14
+            
+            if i % 10 == 0:
+                progress = 50 + int((i / max(total_lines, 1)) * 40)
+                task_manager.update_task(task_id, step=3, step_name=f'Writing content... ({i}/{total_lines} lines)', progress=progress)
+        
+        task_manager.update_task(task_id, step=4, step_name='Saving file...', progress=95)
+        c.save()
+        
+        task_manager.update_task(task_id, step=5, step_name='Complete!', progress=100, status='completed', result={'url': f"/documents/{filename}", 'filename': filename})
+        
+        return f"/documents/{filename}", filename
+        
+    except Exception as e:
+        print(f"[PDF] Generation error: {e}")
+        task_manager.update_task(task_id, status='error', error=str(e))
+        return None, str(e)
+
 def generate_pdf(title, content):
-    """Generate PDF document."""
+    """Generate PDF document (legacy)."""
     try:
         from reportlab.lib.pagesizes import letter
         from reportlab.pdfgen import canvas
@@ -682,6 +855,46 @@ def test_provider(provider):
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
+@app.route('/api/task/<task_id>', methods=['GET'])
+def get_task_status(task_id):
+    """Get status of a running task."""
+    task = task_manager.get_task(task_id)
+    if not task:
+        return jsonify({'error': 'Task not found'}), 404
+    return jsonify(task)
+
+@app.route('/api/task/<task_id>/cancel', methods=['POST'])
+def cancel_task(task_id):
+    """Cancel a running task."""
+    if task_manager.cancel_task(task_id):
+        return jsonify({'success': True, 'message': 'Cancellation requested'})
+    return jsonify({'error': 'Task not found'}), 404
+
+@app.route('/api/task/stream/<task_id>')
+def stream_task_progress(task_id):
+    """Stream task progress via SSE."""
+    def generate():
+        last_status = None
+        while True:
+            task = task_manager.get_task(task_id)
+            if not task:
+                yield f"data: {json.dumps({'error': 'Task not found'})}\n\n"
+                break
+            
+            # Only send updates when something changed
+            current_status = (task.get('status'), task.get('step'), task.get('progress'))
+            if current_status != last_status:
+                yield f"data: {json.dumps(task)}\n\n"
+                last_status = current_status
+            
+            # Exit if task is done
+            if task.get('status') in ['completed', 'error', 'cancelled']:
+                break
+            
+            time.sleep(0.2)  # Poll every 200ms
+    
+    return Response(generate(), mimetype='text/event-stream')
+
 @app.route('/api/conversations', methods=['GET'])
 def list_conversations():
     conn = get_db()
@@ -754,33 +967,101 @@ def stream_chat():
         
         lower_msg = message.lower()
         
-        # Image generation
+        # Image generation with progress tracking
         if any(phrase in lower_msg for phrase in ['generate image', 'create image', 'draw', 'make an image']):
             if ENABLE_IMAGE_GEN:
-                yield f"data: {json.dumps({'content': 'Generating image... '})}\n\n"
-                image_url, error = generate_image(message)
-                if image_url:
-                    yield f"data: {json.dumps({'image': image_url})}\n\n"
-                    yield f"data: {json.dumps({'content': 'Image generated!'})}\n\n"
+                task_id = task_manager.create_task('image_generation')
+                yield f"data: {json.dumps({'task_start': {'id': task_id, 'type': 'image', 'title': '🎨 Image Generation', 'steps': ['Loading Stable Diffusion model', 'Generating image', 'Post-processing', 'Saving to gallery']}})}\n\n"
+                
+                # Run generation in thread and stream progress
+                def run_generation():
+                    generate_image_with_progress(message, task_id)
+                
+                thread = threading.Thread(target=run_generation)
+                thread.start()
+                
+                # Stream progress updates
+                last_progress = -1
+                while thread.is_alive() or task_manager.get_task(task_id).get('status') == 'running':
+                    task = task_manager.get_task(task_id)
+                    if task.get('progress', 0) != last_progress:
+                        yield f"data: {json.dumps({'task_progress': task})}\n\n"
+                        last_progress = task.get('progress', 0)
+                    time.sleep(0.1)
+                
+                thread.join()
+                
+                # Final result
+                task = task_manager.get_task(task_id)
+                if task.get('status') == 'completed' and task.get('result'):
+                    yield f"data: {json.dumps({'image': task['result']})}\n\n"
+                    yield f"data: {json.dumps({'content': '✅ Image generated successfully!'})}\n\n"
+                elif task.get('status') == 'cancelled':
+                    yield f"data: {json.dumps({'content': '⚠️ Image generation was cancelled.'})}\n\n"
                 else:
-                    yield f"data: {json.dumps({'content': f'Failed: {error}'})}\n\n"
+                    yield f"data: {json.dumps({'content': f'❌ Failed: {task.get(\"error\", \"Unknown error\")}'})}\n\n"
+                
+                yield f"data: {json.dumps({'task_complete': task_id})}\n\n"
             else:
-                yield f"data: {json.dumps({'content': 'Image generation not enabled.'})}\n\n"
+                yield f"data: {json.dumps({'content': '⚠️ Image generation is not enabled. Set `ENABLE_IMAGE_GENERATION=true` in your .env file and install the required dependencies (torch, diffusers, transformers).'})}\n\n"
             yield f"data: {json.dumps({'done': True})}\n\n"
             return
         
-        # Document generation
+        # PDF generation with progress tracking
         if any(phrase in lower_msg for phrase in ['generate pdf', 'create pdf']):
-            doc_url, filename = generate_pdf("Generated Document", message)
-            if doc_url:
-                yield f"data: {json.dumps({'document': doc_url, 'document_name': filename})}\n\n"
+            task_id = task_manager.create_task('pdf_generation')
+            yield f"data: {json.dumps({'task_start': {'id': task_id, 'type': 'document', 'title': '📄 PDF Generation', 'steps': ['Importing libraries', 'Creating document', 'Writing content', 'Saving file']}})}\n\n"
+            
+            def run_pdf():
+                generate_pdf_with_progress("Generated Document", message, task_id)
+            
+            thread = threading.Thread(target=run_pdf)
+            thread.start()
+            
+            last_progress = -1
+            while thread.is_alive():
+                task = task_manager.get_task(task_id)
+                if task.get('progress', 0) != last_progress:
+                    yield f"data: {json.dumps({'task_progress': task})}\n\n"
+                    last_progress = task.get('progress', 0)
+                time.sleep(0.1)
+            
+            thread.join()
+            task = task_manager.get_task(task_id)
+            
+            if task.get('status') == 'completed' and task.get('result'):
+                yield f"data: {json.dumps({'document': task['result']['url'], 'document_name': task['result']['filename']})}\n\n"
+                yield f"data: {json.dumps({'content': '✅ PDF document generated!'})}\n\n"
+            elif task.get('status') == 'cancelled':
+                yield f"data: {json.dumps({'content': '⚠️ PDF generation was cancelled.'})}\n\n"
+            else:
+                yield f"data: {json.dumps({'content': f'❌ Failed: {task.get(\"error\", \"Unknown error\")}'})}\n\n"
+            
+            yield f"data: {json.dumps({'task_complete': task_id})}\n\n"
             yield f"data: {json.dumps({'done': True})}\n\n"
             return
         
+        # Word document generation
         if any(phrase in lower_msg for phrase in ['generate word', 'create docx', 'create word']):
+            task_id = task_manager.create_task('docx_generation')
+            yield f"data: {json.dumps({'task_start': {'id': task_id, 'type': 'document', 'title': '📝 Word Document Generation', 'steps': ['Importing libraries', 'Creating document', 'Writing content', 'Saving file']}})}\n\n"
+            
+            # For now, use sync version with simple progress
+            task_manager.update_task(task_id, step=1, step_name='Creating document...', progress=25)
+            yield f"data: {json.dumps({'task_progress': task_manager.get_task(task_id)})}\n\n"
+            
             doc_url, filename = generate_docx("Generated Document", message)
+            
             if doc_url:
+                task_manager.update_task(task_id, step=4, step_name='Complete!', progress=100, status='completed')
+                yield f"data: {json.dumps({'task_progress': task_manager.get_task(task_id)})}\n\n"
                 yield f"data: {json.dumps({'document': doc_url, 'document_name': filename})}\n\n"
+                yield f"data: {json.dumps({'content': '✅ Word document generated!'})}\n\n"
+            else:
+                task_manager.update_task(task_id, status='error', error=filename)
+                yield f"data: {json.dumps({'content': f'❌ Failed: {filename}'})}\n\n"
+            
+            yield f"data: {json.dumps({'task_complete': task_id})}\n\n"
             yield f"data: {json.dumps({'done': True})}\n\n"
             return
         
@@ -1543,20 +1824,27 @@ HTML_TEMPLATE = '''
             40% { transform: translateY(-6px); }
         }
 
-        /* Progress Card */
+        /* Enhanced Progress Card */
         .progress-card {
             background: var(--bg-tertiary);
             border: 1px solid var(--border);
             border-radius: var(--radius-md);
             padding: 20px;
             margin: 12px 0;
+            animation: fadeIn 0.3s ease;
         }
 
         .progress-header {
             display: flex;
             align-items: center;
-            gap: 12px;
+            justify-content: space-between;
             margin-bottom: 16px;
+        }
+
+        .progress-header-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
         }
 
         .progress-icon {
@@ -1568,10 +1856,75 @@ HTML_TEMPLATE = '''
             font-size: 14px;
         }
 
+        .progress-cancel-btn {
+            padding: 6px 12px;
+            background: transparent;
+            border: 1px solid var(--error);
+            border-radius: var(--radius-sm);
+            color: var(--error);
+            font-size: 12px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.2s;
+        }
+        .progress-cancel-btn:hover {
+            background: var(--error);
+            color: white;
+        }
+        .progress-cancel-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .progress-bar-container {
+            margin-bottom: 16px;
+        }
+
+        .progress-bar-bg {
+            height: 8px;
+            background: var(--bg-secondary);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .progress-bar-fill {
+            height: 100%;
+            background: var(--gradient-1);
+            border-radius: 4px;
+            transition: width 0.3s ease;
+            position: relative;
+        }
+
+        .progress-bar-fill::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
+            animation: shimmer 1.5s infinite;
+        }
+
+        @keyframes shimmer {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(100%); }
+        }
+
+        .progress-percentage {
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-top: 6px;
+            display: flex;
+            justify-content: space-between;
+        }
+
         .progress-steps {
             display: flex;
             flex-direction: column;
-            gap: 12px;
+            gap: 10px;
         }
 
         .progress-step {
@@ -1580,6 +1933,7 @@ HTML_TEMPLATE = '''
             gap: 12px;
             font-size: 13px;
             color: var(--text-muted);
+            transition: all 0.2s;
         }
 
         .progress-step.active {
@@ -1588,6 +1942,11 @@ HTML_TEMPLATE = '''
 
         .progress-step.complete {
             color: var(--success);
+        }
+
+        .progress-step.cancelled {
+            color: var(--warning);
+            text-decoration: line-through;
         }
 
         .step-indicator {
@@ -1600,19 +1959,83 @@ HTML_TEMPLATE = '''
             font-size: 12px;
             background: var(--bg-secondary);
             border: 2px solid var(--border);
+            flex-shrink: 0;
+            transition: all 0.2s;
         }
 
         .progress-step.active .step-indicator {
             border-color: var(--accent);
             background: var(--accent);
             color: white;
-            animation: pulse 1s infinite;
+        }
+
+        .progress-step.active .step-indicator::before {
+            content: '';
+            position: absolute;
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            border: 2px solid var(--accent);
+            animation: ping 1s infinite;
+        }
+
+        @keyframes ping {
+            0% { transform: scale(1); opacity: 1; }
+            100% { transform: scale(1.5); opacity: 0; }
         }
 
         .progress-step.complete .step-indicator {
             border-color: var(--success);
             background: var(--success);
             color: white;
+        }
+
+        .step-spinner {
+            width: 16px;
+            height: 16px;
+            border: 2px solid transparent;
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .progress-status {
+            margin-top: 12px;
+            padding: 10px 14px;
+            border-radius: var(--radius-sm);
+            font-size: 13px;
+            display: none;
+        }
+
+        .progress-status.error {
+            display: block;
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid var(--error);
+            color: var(--error);
+        }
+
+        .progress-status.cancelled {
+            display: block;
+            background: rgba(245, 158, 11, 0.15);
+            border: 1px solid var(--warning);
+            color: var(--warning);
+        }
+
+        .progress-status.complete {
+            display: block;
+            background: rgba(16, 185, 129, 0.15);
+            border: 1px solid var(--success);
+            color: var(--success);
+        }
+
+        .progress-elapsed {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-top: 8px;
         }
 
         /* Generated Media */
@@ -2643,6 +3066,19 @@ HTML_TEMPLATE = '''
                             try {
                                 const data = JSON.parse(line.slice(6));
                                 
+                                // Handle task lifecycle events
+                                if (data.task_start) {
+                                    showProgressCard(data.task_start);
+                                }
+                                
+                                if (data.task_progress) {
+                                    updateProgressCard(data.task_progress);
+                                }
+                                
+                                if (data.task_complete) {
+                                    completeProgressCard(data.task_complete);
+                                }
+                                
                                 if (data.content) {
                                     fullContent += data.content;
                                     const streamingMsg = document.getElementById('streaming-message');
@@ -2846,69 +3282,184 @@ HTML_TEMPLATE = '''
         }
 
         // =============================================================================
-        // Progress Cards
+        // Enhanced Progress Cards with Cancellation
         // =============================================================================
         
-        function showProgress(type, title) {
+        let activeTaskId = null;
+        let taskStartTime = null;
+        let taskElapsedInterval = null;
+
+        function showProgressCard(taskData) {
             const container = document.getElementById('messages-container');
+            activeTaskId = taskData.id;
+            taskStartTime = Date.now();
             
-            const steps = {
-                image: [
-                    'Loading Stable Diffusion model',
-                    'Generating image (50 steps)',
-                    'Saving to gallery'
-                ],
-                video: [
-                    'Initializing pipeline',
-                    'Generating base image',
-                    'Animating frames',
-                    'Encoding video'
-                ],
-                document: [
-                    'Preparing content',
-                    'Generating document',
-                    'Saving file'
-                ]
-            };
-            
-            const icon = type === 'image' ? '🎨' : type === 'video' ? '🎬' : '📄';
+            const icon = taskData.type === 'image' ? '🎨' : taskData.type === 'video' ? '🎬' : '📄';
             
             container.insertAdjacentHTML('beforeend', `
-                <div class="progress-card" id="progress-card">
+                <div class="progress-card" id="progress-card-${taskData.id}">
                     <div class="progress-header">
-                        <span class="progress-icon">${icon}</span>
-                        <span class="progress-title">${title}</span>
+                        <div class="progress-header-left">
+                            <span class="progress-icon">${icon}</span>
+                            <span class="progress-title">${taskData.title}</span>
+                        </div>
+                        <button class="progress-cancel-btn" id="cancel-btn-${taskData.id}" onclick="cancelTask('${taskData.id}')">
+                            ✕ Cancel
+                        </button>
                     </div>
-                    <div class="progress-steps">
-                        ${steps[type].map((step, i) => `
-                            <div class="progress-step ${i === 0 ? 'active' : ''}" id="step-${i}">
-                                <div class="step-indicator">${i === 0 ? '⏳' : (i + 1)}</div>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar-bg">
+                            <div class="progress-bar-fill" id="progress-bar-${taskData.id}" style="width: 0%"></div>
+                        </div>
+                        <div class="progress-percentage">
+                            <span id="progress-text-${taskData.id}">Starting...</span>
+                            <span id="progress-percent-${taskData.id}">0%</span>
+                        </div>
+                    </div>
+                    <div class="progress-steps" id="progress-steps-${taskData.id}">
+                        ${taskData.steps.map((step, i) => `
+                            <div class="progress-step" id="step-${taskData.id}-${i}" data-step="${i}">
+                                <div class="step-indicator">${i + 1}</div>
                                 <span>${step}</span>
                             </div>
                         `).join('')}
                     </div>
+                    <div class="progress-status" id="progress-status-${taskData.id}"></div>
+                    <div class="progress-elapsed" id="progress-elapsed-${taskData.id}">Elapsed: 0s</div>
                 </div>
             `);
+            
+            // Start elapsed time counter
+            taskElapsedInterval = setInterval(() => {
+                const elapsed = Math.floor((Date.now() - taskStartTime) / 1000);
+                const elapsedEl = document.getElementById(`progress-elapsed-${taskData.id}`);
+                if (elapsedEl) {
+                    const mins = Math.floor(elapsed / 60);
+                    const secs = elapsed % 60;
+                    elapsedEl.textContent = mins > 0 ? `Elapsed: ${mins}m ${secs}s` : `Elapsed: ${secs}s`;
+                }
+            }, 1000);
             
             scrollToBottom();
         }
 
-        function updateProgress(stepIndex) {
-            const steps = document.querySelectorAll('#progress-card .progress-step');
-            steps.forEach((step, i) => {
-                if (i < stepIndex) {
-                    step.className = 'progress-step complete';
-                    step.querySelector('.step-indicator').textContent = '✓';
-                } else if (i === stepIndex) {
-                    step.className = 'progress-step active';
-                    step.querySelector('.step-indicator').textContent = '⏳';
+        function updateProgressCard(taskProgress) {
+            const taskId = activeTaskId;
+            if (!taskId) return;
+            
+            const progressBar = document.getElementById(`progress-bar-${taskId}`);
+            const progressText = document.getElementById(`progress-text-${taskId}`);
+            const progressPercent = document.getElementById(`progress-percent-${taskId}`);
+            const statusEl = document.getElementById(`progress-status-${taskId}`);
+            const cancelBtn = document.getElementById(`cancel-btn-${taskId}`);
+            
+            if (progressBar) progressBar.style.width = `${taskProgress.progress || 0}%`;
+            if (progressPercent) progressPercent.textContent = `${taskProgress.progress || 0}%`;
+            if (progressText) progressText.textContent = taskProgress.step_name || 'Processing...';
+            
+            // Update steps
+            const currentStep = taskProgress.step || 0;
+            const stepsContainer = document.getElementById(`progress-steps-${taskId}`);
+            if (stepsContainer) {
+                stepsContainer.querySelectorAll('.progress-step').forEach((stepEl, i) => {
+                    stepEl.classList.remove('active', 'complete', 'cancelled');
+                    const indicator = stepEl.querySelector('.step-indicator');
+                    
+                    if (i < currentStep) {
+                        stepEl.classList.add('complete');
+                        indicator.innerHTML = '✓';
+                    } else if (i === currentStep - 1 || (i === 0 && currentStep === 0)) {
+                        if (taskProgress.status === 'running' || taskProgress.status === 'starting') {
+                            stepEl.classList.add('active');
+                            indicator.innerHTML = '<div class="step-spinner"></div>';
+                        }
+                    } else {
+                        indicator.textContent = i + 1;
+                    }
+                });
+            }
+            
+            // Handle status
+            if (taskProgress.status === 'completed') {
+                if (statusEl) {
+                    statusEl.className = 'progress-status complete';
+                    statusEl.textContent = '✅ Completed successfully!';
                 }
-            });
+                if (cancelBtn) cancelBtn.style.display = 'none';
+                clearInterval(taskElapsedInterval);
+            } else if (taskProgress.status === 'cancelled') {
+                if (statusEl) {
+                    statusEl.className = 'progress-status cancelled';
+                    statusEl.textContent = '⚠️ Operation was cancelled';
+                }
+                if (cancelBtn) cancelBtn.style.display = 'none';
+                clearInterval(taskElapsedInterval);
+                // Mark remaining steps as cancelled
+                if (stepsContainer) {
+                    stepsContainer.querySelectorAll('.progress-step:not(.complete)').forEach(s => {
+                        s.classList.add('cancelled');
+                    });
+                }
+            } else if (taskProgress.status === 'error') {
+                if (statusEl) {
+                    statusEl.className = 'progress-status error';
+                    statusEl.textContent = `❌ Error: ${taskProgress.error || 'Unknown error'}`;
+                }
+                if (cancelBtn) cancelBtn.style.display = 'none';
+                clearInterval(taskElapsedInterval);
+            } else if (taskProgress.status === 'cancelling') {
+                if (cancelBtn) {
+                    cancelBtn.disabled = true;
+                    cancelBtn.textContent = '⏳ Cancelling...';
+                }
+            }
+            
+            scrollToBottom();
+        }
+
+        async function cancelTask(taskId) {
+            const cancelBtn = document.getElementById(`cancel-btn-${taskId}`);
+            if (cancelBtn) {
+                cancelBtn.disabled = true;
+                cancelBtn.textContent = '⏳ Cancelling...';
+            }
+            
+            try {
+                await fetch(`/api/task/${taskId}/cancel`, { method: 'POST' });
+                showToast('Cancellation requested...', 'warning');
+            } catch (e) {
+                console.error('Failed to cancel task:', e);
+                showToast('Failed to cancel', 'error');
+            }
+        }
+
+        function completeProgressCard(taskId) {
+            activeTaskId = null;
+            clearInterval(taskElapsedInterval);
+            
+            // Auto-remove card after 3 seconds if successful
+            setTimeout(() => {
+                const card = document.getElementById(`progress-card-${taskId}`);
+                if (card) {
+                    card.style.opacity = '0';
+                    card.style.transform = 'translateY(-10px)';
+                    card.style.transition = 'all 0.3s ease';
+                    setTimeout(() => card.remove(), 300);
+                }
+            }, 3000);
+        }
+
+        // Legacy functions for compatibility
+        function showProgress(type, title) {
+            showProgressCard({ id: 'legacy', type, title, steps: ['Processing...'] });
+        }
+
+        function updateProgress(stepIndex) {
+            updateProgressCard({ step: stepIndex, progress: stepIndex * 25, status: 'running' });
         }
 
         function removeProgress() {
-            const card = document.getElementById('progress-card');
-            if (card) card.remove();
+            completeProgressCard('legacy');
         }
 
         // =============================================================================
