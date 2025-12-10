@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+ENV/
+
+# Environment
+.env
+.env.local
+
+# Database
+*.db
+*.sqlite3
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Uploads and generated content
+workspace/uploads/*
+workspace/gallery/*
+workspace/videos/*
+workspace/documents/*
+!workspace/uploads/.gitkeep
+!workspace/gallery/.gitkeep
+!workspace/videos/.gitkeep
+!workspace/documents/.gitkeep
+
+# Logs
+*.log
+

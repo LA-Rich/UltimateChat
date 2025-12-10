@@ -1,0 +1,23 @@
+# Flask and Core
+flask>=2.3.0
+python-dotenv>=1.0.0
+ollama>=0.1.0
+
+# Image Generation
+diffusers>=0.24.0
+transformers>=4.35.0
+accelerate>=0.24.0
+torch>=2.0.0
+
+# Document Generation
+reportlab>=4.0.0
+python-docx>=0.8.11
+python-pptx>=0.6.21
+
+# Video Generation (optional - uncomment if needed)
+# imageio>=2.31.0
+# imageio-ffmpeg>=0.4.8
+
+# Utilities
+pillow>=10.0.0
+
