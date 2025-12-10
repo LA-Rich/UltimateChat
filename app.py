@@ -999,7 +999,8 @@ def stream_chat():
                 elif task.get('status') == 'cancelled':
                     yield f"data: {json.dumps({'content': '⚠️ Image generation was cancelled.'})}\n\n"
                 else:
-                    yield f"data: {json.dumps({'content': f'❌ Failed: {task.get(\"error\", \"Unknown error\")}'})}\n\n"
+                    error_msg = task.get('error', 'Unknown error')
+                    yield f"data: {json.dumps({'content': f'❌ Failed: {error_msg}'})}\n\n"
                 
                 yield f"data: {json.dumps({'task_complete': task_id})}\n\n"
             else:
@@ -1035,7 +1036,8 @@ def stream_chat():
             elif task.get('status') == 'cancelled':
                 yield f"data: {json.dumps({'content': '⚠️ PDF generation was cancelled.'})}\n\n"
             else:
-                yield f"data: {json.dumps({'content': f'❌ Failed: {task.get(\"error\", \"Unknown error\")}'})}\n\n"
+                error_msg = task.get('error', 'Unknown error')
+                yield f"data: {json.dumps({'content': f'❌ Failed: {error_msg}'})}\n\n"
             
             yield f"data: {json.dumps({'task_complete': task_id})}\n\n"
             yield f"data: {json.dumps({'done': True})}\n\n"
