@@ -4138,6 +4138,23 @@ HTML_TEMPLATE = '''
                 const settings = await response.json();
                 currentProvider = settings.current_provider || 'openai';
                 currentModel = settings.current_model || 'gpt-4o-mini';
+                
+                // Validate saved model exists - if not, reset to default
+                if (providers[currentProvider]) {
+                    const validModels = providers[currentProvider].models || [];
+                    if (!validModels.includes(currentModel)) {
+                        console.log(`Model ${currentModel} not found, resetting to default`);
+                        currentProvider = 'openai';
+                        currentModel = 'gpt-4o-mini';
+                        // Save the reset
+                        fetch('/api/settings/model', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ provider: currentProvider, model: currentModel })
+                        });
+                    }
+                }
+                
                 updateModelDisplay();
             } catch (e) { console.error('Failed to load settings:', e); }
         }
