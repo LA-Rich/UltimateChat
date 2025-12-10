@@ -1349,6 +1349,62 @@ def get_providers():
         }
     return jsonify(result)
 
+@app.route('/api/ollama/models', methods=['GET'])
+def get_ollama_models():
+    """Get list of Ollama models with their download status."""
+    try:
+        url = OLLAMA_HOST + "/api/tags"
+        req = urllib.request.Request(url, method='GET')
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            downloaded = [m['name'] for m in data.get('models', [])]
+            return jsonify({
+                'available': True,
+                'downloaded': downloaded
+            })
+    except Exception as e:
+        return jsonify({
+            'available': False,
+            'downloaded': [],
+            'error': str(e)
+        })
+
+@app.route('/api/ollama/pull', methods=['POST'])
+def pull_ollama_model():
+    """Start pulling an Ollama model - returns immediately, client streams progress."""
+    data = request.json
+    model = data.get('model')
+    if not model:
+        return jsonify({'error': 'No model specified'}), 400
+    return jsonify({'status': 'started', 'model': model})
+
+@app.route('/api/ollama/pull/stream/<model>')
+def stream_ollama_pull(model):
+    """Stream Ollama model pull progress."""
+    def generate():
+        try:
+            url = OLLAMA_HOST + "/api/pull"
+            payload = json.dumps({"name": model, "stream": True}).encode('utf-8')
+            req = urllib.request.Request(url, payload, {"Content-Type": "application/json"}, method='POST')
+            
+            with urllib.request.urlopen(req, timeout=600) as response:
+                buffer = ""
+                for chunk in iter(lambda: response.read(1024), b''):
+                    buffer += chunk.decode('utf-8')
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        if line.strip():
+                            try:
+                                data = json.loads(line)
+                                yield f"data: {json.dumps(data)}\n\n"
+                            except:
+                                pass
+            yield f"data: {json.dumps({'status': 'success'})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+    
+    return Response(generate(), mimetype='text/event-stream')
+
 @app.route('/api/settings', methods=['GET'])
 def get_settings():
     """Get all settings including API keys (masked) and current model."""
@@ -1360,8 +1416,8 @@ def get_settings():
     
     return jsonify({
         'api_keys': masked,
-        'current_provider': get_setting('current_provider', 'ollama'),
-        'current_model': get_setting('current_model', 'llama3.2:latest'),
+        'current_provider': get_setting('current_provider', 'google'),
+        'current_model': get_setting('current_model', 'gemini-2.5-pro'),
         'custom_models': get_custom_models()
     })
 
@@ -1583,8 +1639,8 @@ def stream_chat():
         return jsonify({'error': 'No conversation ID'}), 400
     
     # Use request-specified or saved settings
-    provider = req_provider or get_setting('current_provider', 'ollama')
-    model = req_model or get_setting('current_model', 'llama3.2:latest')
+    provider = req_provider or get_setting('current_provider', 'google')
+    model = req_model or get_setting('current_model', 'gemini-2.5-pro')
     
     def generate():
         conn = get_db()
@@ -2501,6 +2557,126 @@ HTML_TEMPLATE = '''
             transition: all 0.2s;
         }
         .settings-btn:hover { border-color: var(--accent); transform: rotate(45deg); }
+        
+        /* Model Status Indicators */
+        .model-status {
+            font-size: 14px;
+            margin-right: 6px;
+        }
+        
+        .model-option.cloud .model-name { color: var(--text-primary); }
+        .model-option.downloaded .model-name { color: var(--success); }
+        .model-option.not-downloaded { 
+            opacity: 0.7;
+            cursor: pointer;
+        }
+        .model-option.not-downloaded:hover {
+            opacity: 1;
+            background: rgba(139, 92, 246, 0.1);
+        }
+        .model-option.unavailable {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        .cloud-badge, .local-badge {
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            margin-left: 8px;
+        }
+        .cloud-badge {
+            background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+            color: white;
+        }
+        .local-badge {
+            background: var(--bg-tertiary);
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+        }
+        
+        /* Download Modal */
+        .download-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 10000;
+        }
+        
+        .download-content {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            padding: 24px;
+            width: 400px;
+            max-width: 90%;
+        }
+        
+        .download-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 16px;
+        }
+        
+        .download-icon {
+            font-size: 24px;
+            animation: bounce 1s infinite;
+        }
+        
+        @keyframes bounce {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-5px); }
+        }
+        
+        .download-status {
+            color: var(--text-secondary);
+            margin-bottom: 12px;
+        }
+        
+        .download-progress-bar {
+            height: 8px;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            overflow: hidden;
+            margin-bottom: 8px;
+        }
+        
+        .download-progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent), var(--accent-hover));
+            width: 0%;
+            transition: width 0.3s;
+        }
+        
+        .download-details {
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-bottom: 16px;
+        }
+        
+        .download-cancel {
+            width: 100%;
+            padding: 10px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .download-cancel:hover {
+            background: rgba(239, 68, 68, 0.2);
+            border-color: #ef4444;
+        }
         
         /* Modal Styles */
         .modal-overlay {
@@ -3854,8 +4030,8 @@ HTML_TEMPLATE = '''
         let attachments = [];
         let isStreaming = false;
         let providers = {};
-        let currentProvider = 'ollama';
-        let currentModel = 'llama3.2:latest';
+        let currentProvider = 'google';
+        let currentModel = 'gemini-2.5-pro';
         let imageGenEnabled = true;
         let videoGenEnabled = true;
 
@@ -3885,42 +4061,84 @@ HTML_TEMPLATE = '''
         // Provider & Model Management
         // =============================================================================
         
+        let ollamaModels = { available: false, downloaded: [] };
+        let isDownloading = false;
+        
         async function loadProviders() {
             try {
                 const response = await fetch('/api/providers');
                 providers = await response.json();
+                await loadOllamaStatus();
                 renderModelDropdown();
             } catch (e) { console.error('Failed to load providers:', e); }
+        }
+        
+        async function loadOllamaStatus() {
+            try {
+                const response = await fetch('/api/ollama/models');
+                ollamaModels = await response.json();
+            } catch (e) {
+                ollamaModels = { available: false, downloaded: [] };
+            }
         }
         
         async function loadSettings() {
             try {
                 const response = await fetch('/api/settings');
                 const settings = await response.json();
-                currentProvider = settings.current_provider || 'ollama';
-                currentModel = settings.current_model || 'llama3.2:latest';
+                currentProvider = settings.current_provider || 'google';
+                currentModel = settings.current_model || 'gemini-2.5-pro';
                 updateModelDisplay();
             } catch (e) { console.error('Failed to load settings:', e); }
+        }
+        
+        function getModelStatus(provider, model) {
+            if (provider !== 'ollama') {
+                return { icon: '☁️', status: 'cloud', tooltip: 'Cloud model' };
+            }
+            if (!ollamaModels.available) {
+                return { icon: '⚠️', status: 'unavailable', tooltip: 'Ollama not running' };
+            }
+            const modelBase = model.split(':')[0];
+            const isDownloaded = ollamaModels.downloaded.some(m => m.includes(modelBase));
+            if (isDownloaded) {
+                return { icon: '✅', status: 'downloaded', tooltip: 'Downloaded locally' };
+            }
+            return { icon: '📥', status: 'not-downloaded', tooltip: 'Click to download' };
         }
         
         function renderModelDropdown() {
             const dropdown = document.getElementById('model-dropdown');
             let html = '';
             
-            for (const [pid, pdata] of Object.entries(providers)) {
-                html += `<div class="provider-section">
+            // Show cloud providers first (recommended)
+            const sortedProviders = Object.entries(providers).sort((a, b) => {
+                if (a[0] === 'ollama') return 1;
+                if (b[0] === 'ollama') return -1;
+                return 0;
+            });
+            
+            for (const [pid, pdata] of sortedProviders) {
+                const isCloud = pid !== 'ollama';
+                html += `<div class="provider-section ${isCloud ? 'cloud-provider' : 'local-provider'}">
                     <div class="provider-header">
                         <span>${pdata.icon} ${pdata.name}</span>
-                        ${!pdata.configured && pid !== 'ollama' ? '<span class="not-configured">Not configured</span>' : ''}
+                        ${isCloud ? '<span class="cloud-badge">☁️ Cloud</span>' : '<span class="local-badge">💻 Local</span>'}
+                        ${!pdata.configured && pid !== 'ollama' ? '<span class="not-configured">⚠️ No API key</span>' : ''}
                     </div>`;
                 
                 for (const model of pdata.models) {
                     const isActive = pid === currentProvider && model === currentModel;
-                    html += `<div class="model-option ${isActive ? 'active' : ''}" 
-                                  onclick="selectModel('${pid}', '${model}')"
-                                  data-provider="${pid}" data-model="${model}">
+                    const status = getModelStatus(pid, model);
+                    const needsDownload = status.status === 'not-downloaded';
+                    
+                    html += `<div class="model-option ${isActive ? 'active' : ''} ${status.status}" 
+                                  onclick="${needsDownload ? `promptDownload('${model}')` : `selectModel('${pid}', '${model}')`}"
+                                  data-provider="${pid}" data-model="${model}"
+                                  title="${status.tooltip}">
+                        <span class="model-status">${status.icon}</span>
                         <span class="model-name">${model}</span>
-                        <span class="check">✓</span>
+                        ${isActive ? '<span class="check">✓</span>' : ''}
                     </div>`;
                 }
                 html += '</div>';
@@ -4991,6 +5209,129 @@ HTML_TEMPLATE = '''
         
         // Initialize toggles on page load
         document.addEventListener('DOMContentLoaded', initGenerationToggles);
+        
+        // =============================================================================
+        // Ollama Model Download
+        // =============================================================================
+        
+        function promptDownload(model) {
+            if (isDownloading) {
+                showToast('A download is already in progress', 'warning');
+                return;
+            }
+            
+            const confirmed = confirm(`Download "${model}" from Ollama?\n\nThis may take several minutes depending on model size and your connection speed.\n\nClick OK to start downloading.`);
+            
+            if (confirmed) {
+                startModelDownload(model);
+            }
+        }
+        
+        async function startModelDownload(model) {
+            isDownloading = true;
+            
+            // Show download progress modal
+            showDownloadModal(model);
+            
+            try {
+                const eventSource = new EventSource(`/api/ollama/pull/stream/${encodeURIComponent(model)}`);
+                
+                eventSource.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+                    updateDownloadProgress(data);
+                    
+                    if (data.status === 'success' || data.error) {
+                        eventSource.close();
+                        isDownloading = false;
+                        
+                        if (data.status === 'success') {
+                            showToast(`Model "${model}" downloaded successfully!`, 'success');
+                            setTimeout(() => {
+                                hideDownloadModal();
+                                loadOllamaStatus().then(() => {
+                                    renderModelDropdown();
+                                    selectModel('ollama', model);
+                                });
+                            }, 1000);
+                        } else {
+                            showToast(`Download failed: ${data.error}`, 'error');
+                            hideDownloadModal();
+                        }
+                    }
+                };
+                
+                eventSource.onerror = () => {
+                    eventSource.close();
+                    isDownloading = false;
+                    showToast('Download connection lost', 'error');
+                    hideDownloadModal();
+                };
+            } catch (e) {
+                isDownloading = false;
+                showToast(`Download failed: ${e.message}`, 'error');
+                hideDownloadModal();
+            }
+        }
+        
+        function showDownloadModal(model) {
+            // Remove existing modal if any
+            const existing = document.getElementById('download-modal');
+            if (existing) existing.remove();
+            
+            const modal = document.createElement('div');
+            modal.id = 'download-modal';
+            modal.className = 'download-modal';
+            modal.innerHTML = `
+                <div class="download-content">
+                    <div class="download-header">
+                        <span class="download-icon">📥</span>
+                        <span>Downloading ${model}</span>
+                    </div>
+                    <div class="download-status" id="download-status">Connecting to Ollama...</div>
+                    <div class="download-progress-bar">
+                        <div class="download-progress-fill" id="download-progress-fill"></div>
+                    </div>
+                    <div class="download-details" id="download-details"></div>
+                    <button class="download-cancel" onclick="cancelDownload()">Cancel</button>
+                </div>
+            `;
+            document.body.appendChild(modal);
+        }
+        
+        function hideDownloadModal() {
+            const modal = document.getElementById('download-modal');
+            if (modal) modal.remove();
+        }
+        
+        function updateDownloadProgress(data) {
+            const statusEl = document.getElementById('download-status');
+            const progressEl = document.getElementById('download-progress-fill');
+            const detailsEl = document.getElementById('download-details');
+            
+            if (!statusEl) return;
+            
+            if (data.status) {
+                statusEl.textContent = data.status;
+            }
+            
+            if (data.completed && data.total) {
+                const percent = Math.round((data.completed / data.total) * 100);
+                progressEl.style.width = percent + '%';
+                const completedMB = (data.completed / 1024 / 1024).toFixed(1);
+                const totalMB = (data.total / 1024 / 1024).toFixed(1);
+                detailsEl.textContent = `${completedMB} MB / ${totalMB} MB (${percent}%)`;
+            } else if (data.status === 'success') {
+                progressEl.style.width = '100%';
+                statusEl.textContent = '✅ Download complete!';
+            }
+        }
+        
+        function cancelDownload() {
+            // Note: Can't actually cancel the Ollama download, but we can close the modal
+            hideDownloadModal();
+            isDownloading = false;
+            showToast('Download cancelled (may continue in background)', 'warning');
+        }
     </script>
 </body>
 </html>
