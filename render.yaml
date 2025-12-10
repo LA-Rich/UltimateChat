@@ -1,0 +1,21 @@
+# Render Blueprint - https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: ultimate-chat
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.4"
+      - key: APP_PORT
+        sync: false
+      - key: ENABLE_IMAGE_GENERATION
+        value: "false"
+      - key: ENABLE_VIDEO_GENERATION
+        value: "false"
+    disk:
+      name: chat-data
+      mountPath: /data
+      sizeGB: 1
+

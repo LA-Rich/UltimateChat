@@ -23,19 +23,25 @@ load_dotenv()
 # Configuration
 # =============================================================================
 
-APP_PORT = int(os.getenv("APP_PORT", 5001))
+APP_PORT = int(os.getenv("PORT", os.getenv("APP_PORT", 5001)))  # Render uses PORT
 MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", 100)) * 1024 * 1024
 ENABLE_IMAGE_GEN = os.getenv("ENABLE_IMAGE_GENERATION", "false").lower() == "true"
 ENABLE_VIDEO_GEN = os.getenv("ENABLE_VIDEO_GENERATION", "false").lower() == "true"
+IS_PRODUCTION = os.getenv("RENDER", "false").lower() == "true" or os.getenv("PRODUCTION", "false").lower() == "true"
 
-# Paths
+# Paths - Use /data for Render persistent disk, otherwise local workspace
 BASE_DIR = Path(__file__).parent
-WORKSPACE_DIR = BASE_DIR / "workspace"
+if IS_PRODUCTION and Path("/data").exists():
+    DATA_DIR = Path("/data")
+else:
+    DATA_DIR = BASE_DIR
+
+WORKSPACE_DIR = DATA_DIR / "workspace"
 UPLOAD_DIR = WORKSPACE_DIR / "uploads"
 GALLERY_DIR = WORKSPACE_DIR / "gallery"
 VIDEO_DIR = WORKSPACE_DIR / "videos"
 DOCUMENT_DIR = WORKSPACE_DIR / "documents"
-DB_PATH = BASE_DIR / "chat.db"
+DB_PATH = DATA_DIR / "chat.db"
 
 for dir_path in [UPLOAD_DIR, GALLERY_DIR, VIDEO_DIR, DOCUMENT_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
@@ -2975,7 +2981,8 @@ if __name__ == '__main__':
 ║  Server: http://localhost:{APP_PORT}                             ║
 ║  Providers: OpenAI, Anthropic, Google, xAI, Ollama           ║
 ║  Image Generation: {'Enabled' if ENABLE_IMAGE_GEN else 'Disabled':<39}║
+║  Environment: {'Production' if IS_PRODUCTION else 'Development':<43}║
 ╚══════════════════════════════════════════════════════════════╝
     """)
-    app.run(host='0.0.0.0', port=APP_PORT, debug=True, threaded=True)
+    app.run(host='0.0.0.0', port=APP_PORT, debug=not IS_PRODUCTION, threaded=True)
 
